@@ -145,6 +145,9 @@ class Scenarios(unittest.TestCase):
         truth, detail, static, report, _ = self.run_scenario("helpers_switch", {"mode": "full"})
         self.assert_clean(report, truth, detail)
         self.assertEqual([l["rounds"] for l in report["loops"]], [3])
+        # the helper is called twice (and two calls share one line): each box
+        # drawn from one line holds its own agent
+        self.assertTrue(report["helperCopies"] and all(n == 1 for n in report["helperCopies"]), report["helperCopies"])
 
     def test_more_items_than_columns(self):
         truth, detail, static, report, _ = self.run_scenario("big_fanout", {"n": 60})

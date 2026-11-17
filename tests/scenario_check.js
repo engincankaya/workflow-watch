@@ -38,6 +38,13 @@ try {
     if (!where.length && m.nodeOf[a.agentId]) report.notShown.push(a.label);
     if (where.length > 1) report.shownTwice.push({ label: a.label, nodes: where });
   });
+  // agent boxes drawn from the same script line (copies of a helper)
+  const byLine = {};
+  graph.agents.forEach((n) => { (byLine[n.line] = byLine[n.line] || []).push(n); });
+  report.helperCopies = [];
+  Object.keys(byLine).forEach((line) => {
+    if (byLine[line].length > 1) byLine[line].forEach((n) => report.helperCopies.push((m.byNode[n.id] || []).length));
+  });
   const L = G.layout(shown.graph);
   report.layout = { width: L.width, height: L.height, boxes: L.boxes.length,
     finite: L.boxes.every((b) => [b.x, b.y, b.w, b.h].every(Number.isFinite)) && L.edges.every((e) => e.pts.every((p) => p.every(Number.isFinite))) };

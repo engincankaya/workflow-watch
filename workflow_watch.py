@@ -3138,6 +3138,12 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
         if (cands.length) lastUnlabeled = cands[0].node.id;
       }
       if (!cands.length) { unmatched.push(a); return; }
+      if (cands.length > 1 && cands.every(function (c) { return c.node.line === cands[0].node.line; })) {
+        // copies of one agent() call (a helper called from several places):
+        // fill them in script order, one agent each, the last one repeating
+        var free = cands.filter(function (c) { return !byNode[c.node.id]; });
+        cands = free.length ? free : [cands[cands.length - 1]];
+      }
       var target = cands[0].node;   // first in script order among the best
       (byNode[target.id] = byNode[target.id] || []).push(a);
       nodeOf[a.agentId] = target;

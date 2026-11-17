@@ -9,7 +9,7 @@ globalThis.acorn = require(process.argv[2]);
 const G = require(process.argv[3]);
 const input = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
 
-const report = { wrongLine: [], unmatched: [], notShown: [], shownTwice: [], loops: [], fanouts: [], layout: null, error: null };
+const report = { wrongLine: [], unmatched: [], notShown: [], shownTwice: [], loops: [], fanouts: [], subs: [], layout: null, error: null };
 try {
   const graph = input.script ? G.buildGraph(input.script) : G.runtimeGraph(input.agents, input.phases);
   const truth = {};
@@ -26,9 +26,10 @@ try {
   const seenIn = {};
   (function walk(n, path) {
     if (!n) return;
-    if (n.k === "agent") G.instancesFor(n, m).forEach((a) => { (seenIn[a.agentId] = seenIn[a.agentId] || []).push(n.id); });
+    if (n.k === "agent" || n.k === "sub") G.instancesFor(n, m).forEach((a) => { (seenIn[a.agentId] = seenIn[a.agentId] || []).push(n.id); });
     if (n.k === "loop") { const r = G.loopRounds(n, m); report.loops.push({ title: n.title, rounds: r ? r.rounds : null }); }
     if (n.k === "each") report.fanouts.push({ title: n.title, columns: n.expanded || 0, id: n.id });
+    if (n.k === "sub") report.subs.push({ title: n.title, agents: G.instancesFor(n, m).length });
     (n.items || []).forEach((c) => walk(c));
     (n.branches || []).forEach((b) => walk(b.seq));
     if (n.body) walk(n.body);

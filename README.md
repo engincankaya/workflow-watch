@@ -56,7 +56,9 @@ Windows. On Windows, start it with `py workflow_watch.py`.
   ids, times, totals, per-phase counts), then the flow, the agents grouped by
   phase, the `log()` lines, the value the script returned, the input (`args`)
   and the script source.
-- **Flow**: drawn from the script itself, before any agent starts. It shows
+- **Flow**: drawn from left to right like n8n (a button switches to top to
+  bottom; the page remembers the choice), from the script itself, before any
+  agent starts. It shows
   `agent()` calls, `phase()` markers, loops, `if` branches with their
   conditions, `break`/`return`, `parallel()`, `pipeline()` and `.map()`
   fan-outs, helper functions and child `workflow()` calls. It knows nothing
@@ -71,13 +73,15 @@ Windows. On Windows, start it with `py workflow_watch.py`.
   - Run agents are placed by their label templates and phases; an agent whose
     label says nothing is placed by the literal text of its prompt; a result
     replayed from cache gets its label from the earlier run of the session.
-    An agent that cannot be placed is listed under the flow.
+    The agents of a child `workflow()` fill its box. An agent that cannot be
+    placed is listed under the flow.
 - **Agent panel** (click a node or a row): what the agent does now (its last
   tool call and command, how long ago), its last message, what it returned
   (each field name as a small heading with its value below it; Markdown text
   shown as Markdown), its prompt, and all its steps in order.
-  Thinking blocks are hidden unless you turn them on. The panel updates in
-  place, so what you read does not move when new steps arrive.
+  The newest step is on top. Thinking blocks are hidden unless you turn them
+  on. The panel updates in place, so what you read does not move when new
+  steps arrive.
 - **A step, opened**: each tool in its own form, with syntax colours, never as
   raw JSON. Bash is a terminal (the command, the exit code, the output with
   failing and passing lines marked). Edit is a diff of the lines it changed.
@@ -134,11 +138,23 @@ Facts the status depends on:
 - Token numbers of finished runs come from the record. For running runs they
   are estimates from the transcripts (marked `~`).
 
-Not verified with real runs yet (only with the simulator): the label Claude
-Code gives an agent that has no `label`; whether a resumed run writes a
-result line without a start line for a cached agent; how an agent that is
-retried after a stall, or a child `workflow()` run, shows up in these files;
-and the layout on Windows and Linux.
+Seen with a real probe run (Claude Code 2.1.325, 2026-11-17):
+
+- An agent without a `label` is named by the first 60 characters of its
+  prompt (the journal's `label` and the meta file's `description`).
+- A child `workflow()` runs inside the same run: its agents go to the same
+  journal with the phase `▸ <child name>`, and the record's `logs` hold
+  `▸ running dynamic workflow <name>` and `▸ <name> done`.
+- Resuming a run keeps its run id and folder. An unchanged call writes
+  nothing to the journal; agents that run again are appended. The record is
+  written again at the end; replayed agents are marked `"cached": true`,
+  without duration, tokens or tool calls, and the totals count only what ran
+  again. Until the new record is written, the earlier one stays on disk: the
+  page shows the run as running when the session has a later launch of the
+  same run id.
+
+Not verified yet: how an agent that is retried after a stall shows up in
+these files, and the layout on Windows and Linux.
 
 ## When a Claude Code update breaks it
 

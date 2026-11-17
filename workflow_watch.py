@@ -672,6 +672,7 @@ class Run:
         self.dir_mtime = None
         self.agent_files = {}    # agentId -> (transcript path, meta path)
         self.detail_loaded = False
+        self.resumed = False
 
     # -- reading ------------------------------------------------------------
 
@@ -783,7 +784,9 @@ class Run:
 
     @property
     def finished(self):
-        return self.record is not None
+        # a resumed run keeps its run id; the earlier record stays until the
+        # resumed run writes its own
+        return self.record is not None and not self.resumed
 
     def progress_items(self):
         if not self.record:
@@ -827,7 +830,7 @@ class Run:
             "key": base.get("key"),
             "label": base.get("label") or progress.get("label") or meta.get("description") or agent_id,
             "phase": base.get("phase") or progress.get("phaseTitle") or meta.get("workflowPhase"),
-            "cached": bool(base.get("cached")),
+            "cached": bool(base.get("cached") or progress.get("cached")),
             "hasResult": bool(base.get("hasResult")),
             "resultPreview": preview(base.get("result")) if base.get("hasResult") else (
                 progress.get("resultPreview")),
@@ -845,7 +848,10 @@ class Run:
         view["state"] = state
         model = progress.get("model") or (transcript.model if transcript else None) or meta.get("model")
         view["model"] = model
-        start = num(progress.get("startedAt"))
+        # a result replayed from cache when a run is resumed: the record gives
+        # the resume time and no duration; the agent's own transcript tells
+        from_cache = bool(progress.get("cached"))
+        start = None if from_cache else num(progress.get("startedAt"))
         end = None
         if transcript:
             start = start or transcript.first_time
@@ -863,6 +869,8 @@ class Run:
             view["toolCalls"] = progress["toolCalls"]
         if num(progress.get("tokens")) is not None:
             view["tokens"] = progress["tokens"]
+        if from_cache and transcript:
+            end = transcript.last_time
         if num(progress.get("durationMs")) is not None and start:
             end = start + progress["durationMs"]
         if num(progress.get("lastProgressAt")) is not None:
@@ -956,12 +964,15 @@ class Store:
     # -- facts from the session transcripts ------------------------------------
 
     def launch_for(self, run_id):
-        """(launch, launch result, session index) for a run id."""
+        """(launch, launch result, session index) of the latest launch of a
+        run id. A resumed run keeps its run id, so one id can have several."""
+        best = (None, None, None)
         for index in self.sessions.values():
             for tool_use_id, result in index.launch_results.items():
                 if isinstance(result, dict) and result.get("runId") == run_id:
-                    return index.launches.get(tool_use_id), result, index
-        return None, None, None
+                    if best[1] is None or (result.get("_time") or 0) >= (best[1].get("_time") or 0):
+                        best = (index.launches.get(tool_use_id), result, index)
+        return best
 
     def notifications_for(self, run_id, task_id):
         found = []
@@ -1018,8 +1029,17 @@ class Store:
         self._fill_cached_labels(run)
         launch, launch_result, index = self.launch_for(run.run_id)
         record = run.record or {}
-        task_id = record.get("taskId") or (launch_result or {}).get("taskId")
-        notes = self.notifications_for(run.run_id, task_id)
+        relaunched = (launch_result or {}).get("_time")
+        ended = iso_ms(record.get("timestamp"))
+        run.resumed = bool(run.record is not None and relaunched and ended and relaunched > ended)
+        if run.resumed and not run.detail_loaded:
+            run.refresh(full=True)
+        if run.resumed:
+            task_id = (launch_result or {}).get("taskId")
+            notes = [n for n in self.notifications_for(run.run_id, task_id) if (n.get("time") or 0) >= relaunched]
+        else:
+            task_id = record.get("taskId") or (launch_result or {}).get("taskId")
+            notes = self.notifications_for(run.run_id, task_id)
         name = record.get("workflowName") or (launch_result or {}).get("workflowName")
         if not name and launch:
             name = launch["input"].get("name")
@@ -1031,7 +1051,7 @@ class Store:
             starts = [v["start"] for v in agent_views if v.get("start")]
             start = min(starts) if starts else None
         last_activity = run.last_activity()
-        status, status_note = self._status(run, notes, last_activity, now_ms)
+        status, status_note = self._status(run, notes, last_activity, now_ms, launch_result)
         if status not in ("running", "starting"):
             # the run is over: an agent without a result did not finish
             for view in agent_views:
@@ -1050,12 +1070,25 @@ class Store:
         done = len([v for v in agent_views if v["state"] in ("done", "failed")])
         running = len([v for v in agent_views if v["state"] == "running"])
         tokens = num(record.get("totalTokens"))
-        tokens_exact = tokens is not None
+        cached = [v for v in agent_views if v.get("cached")]
+        cached_count = len(cached)
+        if cached_count:
+            # a resumed run's record counts only what ran again: add what the
+            # replayed agents used in the earlier run
+            earlier = sum((v.get("tokens") or v.get("contextTokens") or 0) for v in cached)
+            tokens = (tokens or 0) + earlier if (tokens or earlier) else None
+        tokens_exact = tokens is not None and not cached_count
         if tokens is None:
             known = [v.get("tokens") or v.get("contextTokens") for v in agent_views]
             known = [k for k in known if k]
             tokens = sum(known) if known else None
         tool_calls = num(record.get("totalToolCalls"))
+        if cached_count:
+            earlier_calls = sum((v.get("toolCalls") or 0) for v in cached)
+            tool_calls = (tool_calls or 0) + earlier_calls if (tool_calls or earlier_calls) else None
+        if cached_count and not status_note:
+            status_note = ("%d agent%s returned the result of an earlier run (resumed run)."
+                           % (cached_count, "" if cached_count == 1 else "s"))
         if tool_calls is None:
             counted = [v.get("toolCalls") for v in agent_views if v.get("toolCalls") is not None]
             tool_calls = sum(counted) if counted else None
@@ -1101,10 +1134,19 @@ class Store:
             return None
         return index.cwd
 
-    def _status(self, run, notes, last_activity, now_ms):
+    def _status(self, run, notes, last_activity, now_ms, launch_result=None):
         if run.finished:
             status = run.record.get("status") or "finished"
             return ("finished" if status == "completed" else str(status)), None
+        if run.resumed:
+            relaunched = (launch_result or {}).get("_time") or 0
+            last_activity = max(last_activity or 0, relaunched)
+            resumed = "Resumed at %s; until it ends, totals and results come from the earlier run." % _clock(relaunched)
+            if now_ms - last_activity > self.stale_ms:
+                return "probably stopped", resumed
+            if notes and notes[-1].get("status") and notes[-1]["status"] != "running":
+                return str(notes[-1]["status"]), notes[-1].get("summary")
+            return "running", resumed
         note = None
         if notes:
             latest = notes[-1]
@@ -1782,6 +1824,8 @@ table.grid tr.is-running td:first-child { box-shadow: inset 3px 0 0 var(--run); 
 /* graph */
 .graph-tools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .graph-tools .sub { margin-left: 8px; }
+.graph-tools .spacer-sm { flex: 1; }
+.graph-tools .dir-btn.on { border-color: var(--accent); background: var(--panel-2); font-weight: 600; }
 .graph-wrap { overflow: auto; max-height: 78vh; background:
   radial-gradient(circle, var(--line) 1px, transparent 1px) 0 0 / 18px 18px; border-radius: 0 0 10px 10px; }
 .canvas { position: relative; transform-origin: 0 0; }
@@ -2483,6 +2527,8 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     this.src = source;
     this.fns = {};
     this.consts = {};
+    this.strings = {};   // const NAME = "text": used to read prompts
+    this.subs = [];
     this.nextId = 1;
     this.agents = [];
     this.phase = null;
@@ -2510,6 +2556,9 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
           }
           if (d.id.type === "Identifier" && d.init && d.init.type === "ObjectExpression") {
             self.consts[d.id.name] = d.init;
+          }
+          if (d.id.type === "Identifier" && d.init && typeof literalValue(d.init) === "string") {
+            self.strings[d.id.name] = literalValue(d.init);
           }
         });
       }
@@ -2540,6 +2589,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
         node.declarations.forEach(function (d) {
           if (!d.init) return;
           if (d.id.type === "Identifier" && d.init.type === "ObjectExpression") self.consts[d.id.name] = d.init;
+          if (d.id.type === "Identifier" && typeof literalValue(d.init) === "string") self.strings[d.id.name] = literalValue(d.init);
           if ((d.init.type === "ArrowFunctionExpression" || d.init.type === "FunctionExpression")) {
             if (d.id.type === "Identifier") self.fns[d.id.name] = d.init;
             return;
@@ -2693,8 +2743,9 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
 
   /* Literal pieces of a prompt expression, longest first, to recognise the
      agent's prompt at run time when it has no label to go by. */
-  function promptFragments(node) {
+  function promptFragments(node, strings) {
     var frags = [];
+    strings = strings || {};
     function add(text) {
       String(text).split(/\$\{|\n/).forEach(function (part) {
         part = part.trim();
@@ -2704,10 +2755,34 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     walkAst(node, function (n) {
       if (n.type === "Literal" && typeof n.value === "string") add(n.value);
       if (n.type === "TemplateElement") add(n.value.cooked == null ? n.value.raw : n.value.cooked);
+      if (n.type === "Identifier" && Object.prototype.hasOwnProperty.call(strings, n.name)) add(strings[n.name]);
       if (n.type === "CallExpression" || /Function/.test(n.type)) return false;
     });
     frags.sort(function (a, b) { return b.length - a.length; });
     return frags.slice(0, 6);
+  }
+
+  /* The text a prompt starts with, as far as the script tells: literal text
+     and constants, up to the first part only known at run time. Claude Code
+     names an agent without a label by the first 60 characters of its prompt. */
+  function promptLead(node, strings) {
+    var out = "", open = true;
+    function take(n) {
+      if (!open || !n) return;
+      if (n.type === "Literal" && typeof n.value === "string") { out += n.value; return; }
+      if (n.type === "Identifier" && Object.prototype.hasOwnProperty.call(strings, n.name)) { out += strings[n.name]; return; }
+      if (n.type === "TemplateLiteral") {
+        for (var i = 0; i < n.quasis.length && open; i++) {
+          out += n.quasis[i].value.cooked == null ? n.quasis[i].value.raw : n.quasis[i].value.cooked;
+          if (i < n.expressions.length) take(n.expressions[i]);
+        }
+        return;
+      }
+      if (n.type === "BinaryExpression" && n.operator === "+") { take(n.left); take(n.right); return; }
+      open = false;
+    }
+    take(node);
+    return out;
   }
 
   function calleeName(node) {
@@ -2741,7 +2816,11 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
                  phaseStatic: false, model: null, schema: false, isolation: null, prompt: null,
                  loopVars: (ctx.loopVars || []).slice(), eachVars: (ctx.eachVars || []).slice(), promptFrags: [] };
     var promptArg = call.arguments[0];
-    if (promptArg) { node.prompt = this.text(promptArg, 140); node.promptFrags = promptFragments(promptArg); }
+    if (promptArg) {
+      node.prompt = this.text(promptArg, 140);
+      node.promptFrags = promptFragments(promptArg, this.strings);
+      node.promptLead = promptLead(promptArg, this.strings);
+    }
     var props = this.resolveOpts(call.arguments[1], {}, 0);
     if (props) {
       var self = this;
@@ -2762,7 +2841,11 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
         }
       });
     }
-    if (!node.label) node.label = node.prompt ? "agent(" + node.prompt.slice(0, 40) + ")" : "agent";
+    if (!node.label) {
+      node.unlabeled = true;
+      node.label = node.promptLead && node.promptLead.trim() ? node.promptLead.replace(/\s+/g, " ").trim().slice(0, 60)
+        : (node.prompt ? "agent(" + node.prompt.slice(0, 40) + ")" : "agent");
+    }
     this.agents.push(node);
     return node;
   };
@@ -2946,9 +3029,13 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     }
     if (name === "log") return [];
     if (name === "workflow") {
-      var wf = literalValue(args[0]);
-      return [{ k: "sub", id: this.id("w"), title: "workflow " + (typeof wf === "string" ? wf : (args[0] ? this.text(args[0], 40) : "")),
-                line: node.loc.start.line }];
+      var wf = literalValue(args[0]), child = null;
+      if (typeof wf === "string") child = wf.replace(/^.*:/, "");
+      else if (wf && typeof wf === "object" && typeof wf.scriptPath === "string") child = wf.scriptPath.split(/[\\/]/).pop().replace(/\.m?js$/, "");
+      var sub = { k: "sub", id: this.id("w"), title: "workflow " + (typeof wf === "string" ? wf : (child || (args[0] ? this.text(args[0], 40) : ""))),
+                  child: child, line: node.loc.start.line };
+      this.subs.push(sub);
+      return [sub];
     }
     if (name === "parallel") return this.parallelCall(node, args[0], ctx, "parallel");
     if (name === "pipeline") {
@@ -3050,7 +3137,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     b.registerFunctions(ast.body);
     var ctx = { phase: null, inFn: false, loop: false, depth: 0 };
     var seq = b.seq(ast.body, ctx);
-    return { meta: meta.value, seq: seq, agents: b.agents };
+    return { meta: meta.value, seq: seq, agents: b.agents, subs: b.subs };
   }
 
   // ------------------------------------------------------ fallback graph
@@ -3084,6 +3171,8 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
      { byNode: {nodeId: [agent, ...]}, nodeOf: {agentId: node}, unmatched } */
   function matchAgents(graph, agents, prompts) {
     var byNode = {}, nodeOf = {}, unmatched = [], lastUnlabeled = null;
+    var subs = graph.subs || [];
+    function norm(t) { return String(t || "").replace(/\s+/g, " ").trim(); }
     var compiled = graph.agents.map(function (n) {
       var re = null;
       if (n.labelRe) { try { re = new RegExp(n.labelRe); } catch (e) { re = null; } }
@@ -3100,12 +3189,36 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
       return cands;
     }
     agents.forEach(function (a) {
+      // agents of a child workflow carry the phase "▸ <child name>"
+      var childPhase = /^\u25b8\s*(.+)$/.exec(a.phase || "");
+      if (childPhase && subs.length) {
+        var name = childPhase[1].trim();
+        var sub = subs.filter(function (s) { return s.child === name || (s.child && name.indexOf(s.child) >= 0); })[0] ||
+                  subs.filter(function (s) { return !byNode[s.id]; })[0] || subs[subs.length - 1];
+        (byNode[sub.id] = byNode[sub.id] || []).push(a);
+        nodeOf[a.agentId] = sub;
+        return;
+      }
       var exact = compiled.filter(function (c) { return c.node.exactAgent === a.agentId; });
       var cands = exact.length ? exact : byPhase(compiled.filter(function (c) { return c.re && c.re.test(a.label || ""); }), a);
       if (cands.length > 1) {
         // the most specific template wins: more literal text
         var best = Math.max.apply(null, cands.map(function (c) { return c.node.labelLiteral || 0; }));
         cands = cands.filter(function (c) { return (c.node.labelLiteral || 0) === best; });
+      }
+      if (!cands.length && a.label) {
+        // no label in the script: Claude Code used the prompt's first 60 characters
+        var name60 = norm(a.label);
+        cands = byPhase(compiled.filter(function (c) {
+          if (!c.node.unlabeled) return false;
+          var lead = norm(c.node.promptLead);
+          if (lead.length < 6) return false;
+          return lead.length >= name60.length ? lead.indexOf(name60) === 0 : name60.indexOf(lead) === 0;
+        }), a);
+        if (cands.length > 1) {
+          var longest = Math.max.apply(null, cands.map(function (c) { return norm(c.node.promptLead).length; }));
+          cands = cands.filter(function (c) { return norm(c.node.promptLead).length === longest; });
+        }
       }
       var prompt = prompts && prompts[a.agentId];
       if (!cands.length && prompt) {
@@ -3239,15 +3352,103 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     }
   }
 
-  function layout(graph) {
+  // ---------------------------------------------------- left-to-right layout
+  /* The flow runs from left to right; branches and parallel items stack
+     from top to bottom. Each measured item knows where its flow line is
+     (``line``, from its top), so items of different heights line up. */
+  var LR = { NW: 230, NH: 62, GX: 44, GY: 18, HEAD: 26, PAD: 16, DW: 200, DH: 40, FW: 100, FH: 24,
+             EW: 96, EH: 28, PW: 150, PH: 26, TURN: 16 };
+
+  function measureLR(node) {
+    switch (node.k) {
+      case "seq":
+        var items = node.items.map(measureLR);
+        if (!items.length) return { k: "seq", w: 24, h: 16, line: 8, items: items, empty: true };
+        var line = 0, below = 0, w = 0;
+        items.forEach(function (it, i) { line = Math.max(line, it.line); below = Math.max(below, it.h - it.line); w += it.w + (i ? LR.GX : 0); });
+        return { k: "seq", w: w, h: line + below, line: line, items: items, ends: items[items.length - 1].ends };
+      case "agent": case "sub": return { k: node.k, w: LR.NW, h: LR.NH, line: LR.NH / 2, node: node };
+      case "phase": return { k: "phase", w: LR.PW, h: LR.PH, line: LR.PH / 2, node: node };
+      case "exit": return { k: "exit", w: LR.EW, h: LR.EH, line: LR.EH / 2, node: node, ends: !!(node.end || node.brk || node.cont) && !node.start };
+      case "branch": case "par":
+        var brs = node.branches.map(function (b) { return { label: b.label, m: measureLR(b.seq) }; });
+        var headW = node.k === "branch" ? LR.DW : node.bare ? 0 : LR.FW;
+        var headH = node.k === "branch" ? LR.DH : node.bare ? 0 : LR.FH;
+        var labelW = 0;
+        brs.forEach(function (b) { if (b.label) labelW = Math.max(labelW, b.label.length * 6.6 + 18); });
+        var gapIn = Math.max(LR.TURN * 2, labelW + LR.TURN);
+        var stackH = 0, maxW = 0;
+        brs.forEach(function (b, i) { stackH += b.m.h + (i ? LR.GY : 0); maxW = Math.max(maxW, b.m.w); });
+        var lineB = Math.max(stackH / 2, headH / 2);
+        var hB = Math.max(lineB + stackH / 2, lineB + headH / 2);
+        return { k: node.k, node: node, brs: brs, headW: headW, headH: headH, gapIn: gapIn, stackH: stackH, maxW: maxW,
+                 w: headW + LR.TURN + gapIn + maxW + LR.TURN * 2, h: hB, line: lineB,
+                 ends: brs.length > 0 && brs.every(function (b) { return b.m.ends; }) };
+      case "loop": case "each": case "group":
+        var body = measureLR(node.body);
+        var extra = node.k === "loop" ? LR.TURN : 0;
+        return { k: node.k, node: node, body: body,
+                 w: Math.max(body.w + LR.PAD * 2 + extra * 2, 240), h: LR.HEAD + LR.PAD + body.h + LR.PAD + extra,
+                 line: LR.HEAD + LR.PAD + body.line };
+      default: return { k: "seq", w: 24, h: 16, line: 8, items: [], empty: true };
+    }
+  }
+
+  function placeLR(m, x, y, out) {
+    var lineY = y + m.line;
+    switch (m.k) {
+      case "seq":
+        if (m.empty) { out.edges.push({ pts: [[x, lineY], [x + m.w, lineY]], plain: true }); return; }
+        var cx = x, prev = null, prevRight = x;
+        m.items.forEach(function (it) {
+          if (prev && !prev.ends) out.edges.push({ pts: [[prevRight, lineY], [cx, lineY]] });
+          placeLR(it, cx, lineY - it.line, out);
+          prevRight = cx + it.w; cx += it.w + LR.GX; prev = it;
+        });
+        return;
+      case "agent": case "sub": case "phase": case "exit":
+        out.boxes.push({ kind: m.k, x: x, y: y, w: m.w, h: m.h, node: m.node });
+        return;
+      case "branch": case "par":
+        if (m.k === "branch") out.boxes.push({ kind: "branch", x: x, y: lineY - m.headH / 2, w: m.headW, h: m.headH, node: m.node });
+        else if (!m.node.bare) out.boxes.push({ kind: "fork", x: x, y: lineY - m.headH / 2, w: m.headW, h: m.headH, node: m.node });
+        var forkX = x + m.headW + LR.TURN, brX = forkX + m.gapIn, joinX = brX + m.maxW + LR.TURN;
+        out.edges.push({ pts: [[x + m.headW, lineY], [forkX, lineY]], plain: true });
+        var by = lineY - m.stackH / 2;
+        m.brs.forEach(function (b) {
+          var bl = by + b.m.line;
+          out.edges.push({ pts: [[forkX, lineY], [forkX, bl], [brX, bl]] });
+          if (b.label) out.labels.push({ x: forkX + (brX - forkX) / 2, y: bl - 17, text: b.label });
+          placeLR(b.m, brX, by, out);
+          if (!b.m.ends) out.edges.push({ pts: [[brX + b.m.w, bl], [joinX, bl], [joinX, lineY], [x + m.w, lineY]], plain: true });
+          by += b.m.h + LR.GY;
+        });
+        return;
+      case "loop": case "each": case "group":
+        out.boxes.push({ kind: m.k, x: x, y: y, w: m.w, h: m.h, node: m.node, container: true });
+        var bodyX = x + (m.w - m.body.w) / 2, bodyY = y + LR.HEAD + LR.PAD;
+        out.edges.push({ pts: [[x, lineY], [bodyX, lineY]], plain: true });
+        if (!m.body.ends) out.edges.push({ pts: [[bodyX + m.body.w, lineY], [x + m.w, lineY]], plain: true });
+        placeLR(m.body, bodyX, bodyY, out);
+        if (m.k === "loop") {
+          var r = bodyX + m.body.w + LR.TURN / 2, l = bodyX - LR.TURN / 2, b2 = bodyY + m.body.h + LR.TURN / 2;
+          out.edges.push({ pts: [[r, lineY], [r, b2], [l, b2], [l, lineY], [bodyX, lineY]], back: true });
+        }
+        return;
+    }
+  }
+
+  /* Lay the graph out: "lr" (default) from left to right, "tb" from top
+     to bottom. Returns {boxes, edges, labels, width, height}. */
+  function layout(graph, dir) {
     var startEnd = { k: "seq", items: [{ k: "exit", id: "start", text: "start", start: true }]
                      .concat(graph.seq.items) };
     var last = graph.seq.items[graph.seq.items.length - 1];
     if (!last || last.k !== "exit" || !last.end) startEnd.items.push({ k: "exit", id: "end", text: "end", end: true });
-    var m = measure(startEnd);
-    var out = { boxes: [], edges: [], labels: [] };
-    var margin = 24;
-    place(m, margin, margin, out);
+    var out = { boxes: [], edges: [], labels: [], dir: dir === "tb" ? "tb" : "lr" };
+    var margin = 24, m;
+    if (out.dir === "tb") { m = measure(startEnd); place(m, margin, margin, out); }
+    else { m = measureLR(startEnd); placeLR(m, margin, margin, out); }
     out.width = m.w + margin * 2;
     out.height = m.h + margin * 2;
     return out;
@@ -3696,7 +3897,8 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
   function runView(main, runId) {
     var stopped = false, timer = null, version = null;
     var st = { detail: null, stat: null, graph: null, graphNote: null, nodeEls: {}, match: null,
-               zoom: 1, userZoom: false, runtimeKey: null, selected: null, prompts: {}, promptsBusy: false };
+               zoom: 1, userZoom: false, runtimeKey: null, selected: null, prompts: {}, promptsBusy: false,
+               dir: store("ww.dir") === "tb" ? "tb" : "lr" };
     document.getElementById("crumb").textContent = runId;
 
     var headBox = el("div", { class: "body" });
@@ -3710,6 +3912,9 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
       el("button", { text: "Fit", title: "Fit the width", on: { click: fitZoom } }),
       el("button", { text: "100%", on: { click: function () { setZoom(1); } } }),
       zoomLabel,
+      el("span", { class: "spacer-sm" }),
+      dirButton("lr", "→ Left to right"),
+      dirButton("tb", "↓ Top to bottom"),
     ]);
     var agentsBox = el("div", { class: "wrap-scroll" });
     var logsSection = el("section", { class: "section", hidden: true });
@@ -3730,6 +3935,15 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     main.appendChild(el("section", { class: "section" }, [el("h2", { text: "Input and script" }), el("div", { class: "body" }, [argsBox, scriptBox])]));
 
     window.addEventListener("resize", function () { if (!stopped) applyZoom(); });
+    function dirButton(dir, text) {
+      var b = el("button", { class: "dir-btn" + (st.dir === dir ? " on" : ""), "data-dir": dir, text: text,
+        on: { click: function () {
+          st.dir = dir; store("ww.dir", dir); st.userZoom = false;
+          tools.querySelectorAll(".dir-btn").forEach(function (x) { x.classList.toggle("on", x.getAttribute("data-dir") === dir); });
+          drawGraph();
+        } } });
+      return b;
+    }
     function setZoom(z) {
       st.userZoom = true;
       st.zoom = Math.max(0.3, Math.min(2, z));
@@ -3835,7 +4049,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
       st.runtimeChanged = false;
       clear(graphNoteBox);
       if (st.graphNote) graphNoteBox.appendChild(el("p", { class: "note", text: st.graphNote }));
-      var lay = G.layout(graph);
+      var lay = G.layout(graph, st.dir);
       st.layout = lay;
       st.nodeEls = {};
       var canvas = el("div", { class: "canvas", style: "width:" + lay.width + "px;height:" + lay.height + "px" });
@@ -3869,7 +4083,12 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
           box.addEventListener("keydown", function (e) { if (e.key === "Enter") openNode(n); });
           box.title = (n.label || "") + (n.line ? "  (script line " + n.line + ")" : "");
         } else if (b.kind === "sub") {
-          box = el("div", { class: "gnode idle", style: style }, [el("div", { class: "l1", text: n.title }), el("div", { class: "l2", text: "child workflow" })]);
+          box = el("div", { class: "gnode idle sub-wf", style: style, tabindex: "0", role: "button" }, [
+            el("div", { class: "l1" }, [el("span", { class: "tick-mark" }), el("span", { class: "lbl", text: n.title })]),
+            el("div", { class: "l2", text: "child workflow" }), el("div", { class: "l3" }),
+          ]);
+          box.addEventListener("click", function () { openNode(n); });
+          box.addEventListener("keydown", function (e) { if (e.key === "Enter") openNode(n); });
         } else if (b.kind === "phase") {
           box = el("div", { class: "gnode phase", style: style }, [el("div", { class: "l1", text: n.title })]);
         } else if (b.kind === "exit") {
@@ -3895,8 +4114,10 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
       canvasWrap.appendChild(el("div", { class: "sizer" }));
       canvasWrap.appendChild(canvas);
       if (!st.userZoom) {
+        // fit the width, but never so small that the text cannot be read:
+        // a long left-to-right flow scrolls sideways instead
         var fit = (canvasWrap.clientWidth - 8) / lay.width;
-        st.zoom = fit < 1 ? Math.max(0.45, fit) : 1;
+        st.zoom = fit < 1 ? Math.max(st.dir === "lr" ? 0.7 : 0.45, fit) : 1;
       }
       applyZoom();
       paintGraph();
@@ -3947,6 +4168,22 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
             l3.textContent = (latest.cached ? "from cache" : "done in " + fmtDur((latest.end || 0) - (latest.start || 0))) +
               (latest.toolCalls != null ? " · " + latest.toolCalls + " tools" : "");
           }
+        } else if (info.kind === "sub") {
+          var kids = G.instancesFor(n, st.match);
+          var kst = nodeState(kids);
+          box.className = "gnode sub-wf " + kst + (st.selected === id ? " selected" : "");
+          var running = kids.filter(function (a) { return a.state === "running"; }).length;
+          var finished = kids.filter(function (a) { return a.state === "done" || a.state === "failed"; }).length;
+          box.querySelector(".tick-mark").textContent = kst === "done" ? "✔" : kst === "failed" ? "✖" : "";
+          box.querySelector(".l2").textContent = "child workflow" + (kids.length ? " · " + kids.length + " agent" + (kids.length > 1 ? "s" : "") : "");
+          var l3s = box.querySelector(".l3");
+          clear(l3s);
+          if (!kids.length) l3s.textContent = "not started";
+          else if (running) {
+            var now = kids.filter(function (a) { return a.state === "running"; }).pop();
+            l3s.appendChild(document.createTextNode("▸ " + now.label + " · "));
+            l3s.appendChild(ago(now.lastActivity));
+          } else l3s.textContent = finished + " of " + kids.length + " done";
         } else if (info.kind === "loop" || info.kind === "each" || info.kind === "group") {
           var below = G.agentsBelow(n.body), all = [];
           var maxCount = 0;
@@ -4378,7 +4615,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     shown.forEach(function (s) {
       var item = dom.items[s.i];
       if (item) updateStepItem(item, s);
-      else { item = stepItem(s); dom.items[s.i] = item; dom.list.appendChild(item.li); }
+      else { item = stepItem(s); dom.items[s.i] = item; dom.list.insertBefore(item.li, dom.list.firstChild); }   // newest on top
     });
 
     if (data.meta && changed(dom, "meta", true)) {

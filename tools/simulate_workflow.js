@@ -24,10 +24,15 @@
      --max-concurrent N     agents at one time (default 16)
      --stop-after N         stop after N agents started, without a record (a cut-off run)
      --fail REGEX           agents whose label matches return null
-     --cached N             the first N agents return at once from "cache" (no start line)
+     --resume RUN           resume that run, as Claude Code does: same run id and folder;
+                            an agent whose call is unchanged returns its earlier result and
+                            writes nothing; the others run and are appended; a new record
+                            replaces the old one at the end
+     --workflows-dir DIR    where workflow('name') finds a child script (<name>.js or its meta name)
      --launch-by-name NAME  the session launches the workflow by name, not by script
      --truth FILE           write the agent -> script line truth here
-     --unlabeled-label T    label for agent() calls without one: "prompt" (default) or "empty"
+     --unlabeled-label T    label for agent() calls without one: "prompt" (default: the first
+                            60 characters of the prompt, as Claude Code 2.1.325 does) or "empty"
 
    Writes only under --root. This is a development tool; the viewer itself
    does not need Node. */
@@ -51,7 +56,8 @@ function parseArgs(argv) {
     else if (k === "--max-concurrent") o.maxConcurrent = Number(take());
     else if (k === "--stop-after") o.stopAfter = Number(take());
     else if (k === "--fail") o.fail = new RegExp(take());
-    else if (k === "--cached") o.cached = Number(take());
+    else if (k === "--resume") o.resume = take();
+    else if (k === "--workflows-dir") o.workflowsDir = take();
     else if (k === "--launch-by-name") o.byName = take();
     else if (k === "--truth") o.truth = take();
     else if (k === "--unlabeled-label") o.unlabeled = take();
@@ -75,8 +81,10 @@ const sessionDir = path.join(projectDir, opts.session);
 fs.mkdirSync(sessionDir, { recursive: true });
 let runCounter = 0;
 try { runCounter = fs.readdirSync(path.join(sessionDir, "subagents", "workflows")).length; } catch (e) { /* first run */ }
-const runId = opts.run || "wf_sim" + String(runCounter + 1).padStart(4, "0") + "-" + path.basename(opts.script, ".js").replace(/[^a-z0-9]/gi, "").slice(0, 8);
-const taskId = "w" + runId.replace(/[^a-z0-9]/gi, "").slice(-8);
+const runId = opts.resume || opts.run || "wf_sim" + String(runCounter + 1).padStart(4, "0") + "-" + path.basename(opts.script, ".js").replace(/[^a-z0-9]/gi, "").slice(0, 8);
+const crypto = require("crypto");
+const launchSalt = crypto.createHash("sha256").update(runId + "|" + process.hrtime.bigint()).digest("hex");
+const taskId = "w" + launchSalt.slice(0, 8);
 const runDir = path.join(sessionDir, "subagents", "workflows", runId);
 fs.mkdirSync(runDir, { recursive: true });
 const journal = path.join(runDir, "journal.jsonl");
@@ -85,7 +93,21 @@ const iso = () => new Date().toISOString();
 const append = (file, rec) => fs.appendFileSync(file, JSON.stringify(rec) + "\n");
 
 // ------------------------------------------------------------ the session
-const toolUseId = "toolu_sim_" + runId.replace(/[^a-z0-9]/gi, "");
+const toolUseId = "toolu_sim_" + launchSalt.slice(0, 20);
+// a resumed run: the results of the earlier run, by call key
+const cache = {}, earlierProgress = {};
+if (opts.resume) {
+  try {
+    fs.readFileSync(journal, "utf8").split("\n").filter(Boolean).forEach((line) => {
+      const rec = JSON.parse(line);
+      if (rec.type === "result" && rec.key) cache[rec.key] = rec.result;
+    });
+  } catch (e) { /* nothing to resume */ }
+  try {
+    const old = JSON.parse(fs.readFileSync(path.join(sessionDir, "workflows", runId + ".json"), "utf8"));
+    (old.workflowProgress || []).forEach((p) => { if (p.agentId) earlierProgress[p.agentId] = p; });
+  } catch (e) { /* the earlier run has no record */ }
+}
 const launchInput = opts.byName ? { name: opts.byName } : { script: source };
 if (opts.args !== undefined) launchInput.args = opts.args;
 append(sessionFile, { type: "assistant", timestamp: iso(), cwd, sessionId: opts.session,
@@ -142,25 +164,31 @@ async function slot() {
 }
 function release() { running--; const next = waiting.shift(); if (next) next(); }
 
+let childPhase = null;   // set while a child workflow runs
 async function agent(prompt, o) {
   o = o || {};
   const line = callLine();
   const n = ++agentCount;
   if (opts.stopAfter && n > opts.stopAfter) { stopped = true; await new Promise(() => {}); }   // the run is cut off here
-  const agentId = "a" + n.toString(16).padStart(16, "0");
+  const agentId = "a" + crypto.createHash("sha256").update(launchSalt + "|" + n).digest("hex").slice(0, 16);
   const label = o.label != null ? String(o.label)
-    : (opts.unlabeled === "empty" ? "" : String(prompt).replace(/\s+/g, " ").slice(0, 40));
-  const phase = o.phase || currentPhase;
+    : (opts.unlabeled === "empty" ? "" : String(prompt).slice(0, 60));
+  const phase = childPhase || o.phase || currentPhase;
   // like Claude Code, the key depends on the call, not on the run, so a
   // resumed run gives a cached agent the key it had in the earlier run
   const key = "v2:" + require("crypto").createHash("sha256").update(n + "|" + label + "|" + String(prompt)).digest("hex");
   const schema = o.schema;
-  const value = opts.fail && opts.fail.test(label) ? null : fake(schema, label);
-  truth.push({ agentId, label, line, phase });
-  if (opts.cached && n <= opts.cached) {
-    append(journal, { type: "result", key, agentId, result: value });
-    return value;
+  if (Object.prototype.hasOwnProperty.call(cache, key)) {
+    // unchanged call of a resumed run: its earlier result, and nothing written
+    truth.push({ agentId: null, label, line, phase, cached: true });
+    const old = Object.values(earlierProgress).find((p) => p.label === label);
+    progress.push({ type: "workflow_agent", index: progress.length + 1, label, phaseTitle: phase,
+      agentId: old ? old.agentId : null, model: old ? old.model : "claude-sim-1", state: "done",
+      startedAt: Date.now(), lastProgressAt: Date.now(), cached: true });
+    return cache[key];
   }
+  const value = opts.fail && opts.fail.test(label) ? null : fake(schema, label);
+  truth.push({ agentId, label, line: childPhase ? null : line, phase });
   await slot();
   const started = Date.now();
   append(journal, { type: "started", key, agentId, label, phase });
@@ -203,15 +231,41 @@ async function pipeline(items, ...stages) {
 }
 function phase(title) { currentPhase = title; }
 function log(message) { logs.push(String(message)); }
-async function workflow(name) { logs.push("(simulator) child workflow " + name + " is not simulated"); return null; }
+/* workflow(nameOrRef, args): Claude Code 2.1.325 runs the child in the same
+   run: its agents go to the same journal with the phase "▸ <child name>". */
+async function workflow(ref, childArgs) {
+  let file = null;
+  if (ref && typeof ref === "object" && ref.scriptPath) file = ref.scriptPath;
+  else if (typeof ref === "string" && opts.workflowsDir) {
+    const short = ref.replace(/^.*:/, "");
+    const candidates = fs.readdirSync(opts.workflowsDir).filter((f) => /\.m?js$/.test(f)).map((f) => path.join(opts.workflowsDir, f));
+    file = candidates.find((f) => path.basename(f).replace(/\.m?js$/, "") === short) ||
+      candidates.find((f) => (fs.readFileSync(f, "utf8").match(/name\s*:\s*['"`]([^'"`]+)/) || [])[1] === short) || null;
+  }
+  if (!file) throw new Error("child workflow not found: " + JSON.stringify(ref));
+  const childSource = fs.readFileSync(file, "utf8");
+  const childName = (childSource.match(/name\s*:\s*['"`]([^'"`]+)/) || [])[1] || path.basename(file, ".js");
+  logs.push("\u25b8 running dynamic workflow " + childName);
+  const body = childSource.replace(/^\s*export\s+const\s+meta\s*=/m, "const meta =");
+  const ctx = vm.createContext(Object.assign({}, contextBase, { args: childArgs }));
+  const before = childPhase;
+  childPhase = "\u25b8 " + childName;
+  try {
+    return await new vm.Script("(async () => {\n" + body + "\n})()", { filename: "child-script.js", lineOffset: -1 }).runInContext(ctx);
+  } finally {
+    childPhase = before;
+    logs.push("\u25b8 " + childName + " done");
+  }
+}
 
 // -------------------------------------------------------------- run it
 const body = source.replace(/^\s*export\s+const\s+meta\s*=/m, "const meta =");
 const wrapped = "(async () => {\n" + body + "\n})()";
-const context = vm.createContext({ agent, parallel, pipeline, phase, log, workflow, args: opts.args,
-  budget: { total: null, spent: () => 0, remaining: () => Infinity }, console, JSON, Math, Object, Array, Promise, Set, Map, String, Number, Boolean, Error });
+const contextBase = { agent, parallel, pipeline, phase, log, workflow,
+  budget: { total: null, spent: () => 0, remaining: () => Infinity }, console, JSON, Math, Object, Array, Promise, Set, Map, String, Number, Boolean, Error };
+const context = vm.createContext(Object.assign({}, contextBase, { args: opts.args }));
 const started = Date.now();
-fs.writeFileSync(journal, JSON.stringify({ type: "launched" }) + "\n");
+if (!opts.resume || !fs.existsSync(journal)) fs.writeFileSync(journal, JSON.stringify({ type: "launched" }) + "\n");
 append(sessionFile, { type: "user", timestamp: iso(), cwd, sessionId: opts.session, message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId,
   content: "Workflow launched in background. Task ID: " + taskId }] },
   toolUseResult: { status: "async_launched", taskId, taskType: "local_workflow", workflowName: opts.byName || (source.match(/name\s*:\s*['"`]([^'"`]+)/) || [])[1] || "sim",
@@ -235,8 +289,8 @@ promise.then((result) => {
     runId, timestamp: iso(), taskId, script: source, args: opts.args, result, agentCount: progress.length, logs,
     durationMs: Date.now() - started, summary: "Simulated run of " + path.basename(opts.script),
     workflowName: opts.byName || (source.match(/name\s*:\s*['"`]([^'"`]+)/) || [])[1] || "sim", status: "completed", startTime: started,
-    phases, workflowProgress: progress, totalTokens: progress.reduce((s, p) => s + p.tokens, 0),
-    totalToolCalls: progress.reduce((s, p) => s + p.toolCalls, 0) }));
+    phases, workflowProgress: progress, totalTokens: progress.reduce((s, p) => s + (p.tokens || 0), 0),
+    totalToolCalls: progress.reduce((s, p) => s + (p.toolCalls || 0), 0) }));
   append(sessionFile, { type: "queue-operation", operation: "enqueue", timestamp: iso(), sessionId: opts.session,
     content: "<task-notification>\n<task-id>" + taskId + "</task-id>\n<status>completed</status>\n<summary>Dynamic workflow completed</summary>\n</task-notification>" });
   console.log("finished", runId, progress.length, "agents");

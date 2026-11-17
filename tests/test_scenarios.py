@@ -179,17 +179,60 @@ class Scenarios(unittest.TestCase):
         failed = sorted(a["label"] for a in detail["agents"] if a["state"] == "failed")
         self.assertEqual(failed, ["audit:3"] + (["verify:1"] if any(a["label"] == "verify:1" for a in detail["agents"]) else []))
 
-    def test_results_from_cache(self):
-        # a run, then a resumed run in the same session: its first two agents
-        # come back from cache, with result lines only
-        first, root = self.simulate("serial_rounds", {"topic": "x"})
-        truth, _ = self.simulate("serial_rounds", {"topic": "x"}, extra=["--cached", "2"], root=root)
-        self.assertNotEqual(first["runId"], truth["runId"])
-        store, detail, static, prompts = self.view(root, truth["runId"])
-        report = self.check(truth, detail, static, prompts)
+    def test_child_workflow(self):
+        # Claude Code runs a child workflow in the same run: its agents go to
+        # the same journal with the phase "\u25b8 <child name>"
+        truth, detail, static, report, _ = self.run_scenario(
+            "child_parent", extra=["--workflows-dir", str(SCEN / "children")])
         self.assert_clean(report, truth, detail)
-        self.assertEqual([a["cached"] for a in detail["agents"]][:2], [True, True])
-        self.assertEqual(detail["agents"][0]["label"], "write:x")
+        phases = sorted({a["phase"] or "" for a in detail["agents"]})
+        self.assertIn("\u25b8 child-flow", phases)
+        self.assertEqual(report["subs"], [{"title": "workflow child-flow", "agents": 2}])
+        self.assertIn("\u25b8 running dynamic workflow child-flow", detail["logs"])
+
+    def test_unlabeled_agent_is_named_by_its_prompt(self):
+        # an agent without a label is named by the first 60 characters of its
+        # prompt (seen with Claude Code 2.1.325); the prompt starts with a constant
+        truth, detail, static, report, _ = self.run_scenario(
+            "child_parent", extra=["--workflows-dir", str(SCEN / "children")])
+        first = detail["agents"][0]
+        self.assertEqual(first["label"], ("Write plainly, in short sentences. Write the release notes page.")[:60])
+        self.assertEqual(report["wrongLine"], [])
+
+    def test_resumed_run(self):
+        # a resumed run keeps its run id and folder; unchanged calls write
+        # nothing; the earlier record stays until the resumed run ends
+        first, root = self.simulate("resume_flow", {"v": 1})
+        run_id = first["runId"]
+        proc, _, truth_path = self.simulate("resume_flow", {"v": 2}, extra=["--resume", run_id],
+                                            root=root, step_ms=400, wait=False)
+        try:
+            seen = None
+            store = ww.Store(root)
+            for _ in range(60):
+                time.sleep(0.1)
+                store.last_refresh = None
+                detail = store.run_detail(run_id)
+                if detail["run"]["status"] == "running":
+                    seen = detail
+                    break
+            self.assertIsNotNone(seen, "the resumed run was not shown as running")
+            self.assertIn("Resumed", seen["run"]["statusNote"])
+            self.assertEqual(len([r for r in store.list_runs()["runs"] if r.get("kind") == "run"]), 1)
+        finally:
+            proc.communicate(timeout=60)
+        store.last_refresh = None
+        detail = store.run_detail(run_id)
+        self.assertEqual(detail["run"]["status"], "finished")
+        labels = [a["label"] for a in detail["agents"]]
+        self.assertEqual(labels, ["collect", "draft", "polish", "polish"])   # the old and the new polish
+        truth = json.loads(truth_path.read_text())
+        self.assertEqual([t["cached"] for t in truth["agents"] if t.get("cached")], [True, True])
+        # the new record marks them "cached", without duration or tokens
+        self.assertEqual([a["cached"] for a in detail["agents"]], [True, True, False, False])
+        self.assertTrue(all(a["end"] and a["end"] >= a["start"] for a in detail["agents"][:2]))
+        self.assertFalse(detail["run"]["tokensExact"])
+        self.assertIn("returned the result of an earlier run", detail["run"]["statusNote"])
 
     def test_cut_off_run(self):
         truth, root = self.simulate("fanout_audit", extra=["--stop-after", "6"])

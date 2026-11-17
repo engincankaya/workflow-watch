@@ -68,4 +68,22 @@ H.tokens(mid, "python");
 check("100 kB highlights in under 2 s", Date.now() - t1 < 2000, Date.now() - t1);
 check("long text fast", Date.now() - t0 < 4000);
 
+// markdown
+const md = H.markdown("## Title\n\n- **Test run:** 773 passed, `0` failed\n- Nested:\n  1. one\n  2. *two* [link](https://x.y)\n- [x] done\n\n> quote\n\n| a | b |\n|---|--:|\n| 1 | `x|y` |\n\n```python\ndef f():\n    pass\n```\nLine one\nline two");
+check("md kinds", md.map((b) => b.t).join(",") === "h,ul,quote,table,code,p", md.map((b) => b.t));
+check("md bold in item", md[1].items[0].blocks[0].inl[0].t === "b" && md[1].items[0].blocks[0].inl[0].c[0].v === "Test run:");
+check("md inline code", md[1].items[0].blocks[0].inl.some((n) => n.t === "code" && n.v === "0"));
+check("md nested ordered list", md[1].items[1].blocks[1].t === "ol" && md[1].items[1].blocks[1].items.length === 2);
+check("md link", JSON.stringify(md[1].items[1].blocks[1].items[1]).indexOf("https://x.y") >= 0);
+check("md task", md[1].items[2].task === true);
+check("md table align", md[3].align[1] === "right" && md[3].rows[0][1][0].v === "x|y");
+check("md code lang", md[4].lang === "python" && md[4].text === "def f():\n    pass");
+check("md line break", md[5].inl.some((n) => n.t === "br"));
+check("md hint yes", H.looksLikeMarkdown("- **Test run:** x"));
+check("md hint no", !H.looksLikeMarkdown("Plain words, no marks."));
+const html = H.markdown("<script>alert(1)</script> **b**");
+check("md keeps html as text", html[0].inl[0].t === "text" && html[0].inl[0].v.indexOf("<script>") === 0);
+check("md unclosed fence", H.markdown("```\nopen").length === 1);
+check("md deep nesting stops", Array.isArray(H.markdown(Array.from({ length: 40 }, (_, i) => " ".repeat(i * 2) + "- x").join("\n"))));
+
 console.log(JSON.stringify({ passed, failed }));

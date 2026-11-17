@@ -1848,6 +1848,30 @@ details[open] > summary { margin-bottom: 6px; }
 .steps .skind.tool-write { color: #8250df; } .steps .skind.tool-read { color: #0969da; }
 .steps .skind.tool-grep, .steps .skind.tool-glob { color: #1b7c83; } .steps .skind.tool-structuredoutput { color: var(--done); }
 @media (max-width: 720px) { .steps .sdetail { margin-left: 0; } }
+
+/* ---- markdown ---- */
+.md { line-height: 1.55; word-break: break-word; }
+.md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; }
+.md .md-h { margin: 14px 0 6px; line-height: 1.3; }
+.md .md-h1 { font-size: 18px; } .md .md-h2 { font-size: 16px; } .md .md-h3 { font-size: 14.5px; }
+.md .md-h4, .md .md-h5, .md .md-h6 { font-size: 13.5px; color: var(--muted); }
+.md ul, .md ol { margin: 4px 0 8px; padding-left: 22px; }
+.md li { margin: 3px 0; }
+.md li > ul, .md li > ol { margin: 3px 0; }
+.md li.md-task { list-style: none; margin-left: -18px; }
+.md .md-check { margin-right: 6px; color: var(--muted); } .md .md-check.on { color: var(--run); }
+.md .md-code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; background: var(--code-bg2);
+  border: 1px solid var(--code-line); border-radius: 4px; padding: 0 4px; }
+.md blockquote { margin: 6px 0; padding: 2px 12px; border-left: 3px solid var(--line-strong); color: var(--muted); }
+.md hr { border: none; border-top: 1px solid var(--line); margin: 12px 0; }
+.md strong { font-weight: 650; }
+.md .md-table-wrap { overflow-x: auto; margin: 6px 0 10px; }
+.md table.md-table { border-collapse: collapse; font-size: 13px; }
+.md table.md-table th, .md table.md-table td { border: 1px solid var(--line); padding: 4px 10px; vertical-align: top; }
+.md table.md-table th { background: var(--panel-2); font-weight: 600; text-align: left; }
+.md .md-link { text-decoration: underline dotted; }
+.val-obj > dd > .md { padding-top: 1px; }
 """
 
 HIGHLIGHT_JS = r"""/* workflow-watch: a small syntax highlighter and line diff. It returns
@@ -2103,7 +2127,157 @@ HIGHLIGHT_JS = r"""/* workflow-watch: a small syntax highlighter and line diff. 
     return rows;
   }
 
-  var api = { tokens: tokens, lines: lines, langFor: langFor, sniff: sniff, diffLines: diffLines, languages: Object.keys(LANGS) };
+  // ---------------------------------------------------------- markdown
+  /* A small Markdown reader (CommonMark-like subset, with GitHub tables and
+     task lists). It returns a tree; the page builds DOM nodes from it with
+     textContent, so no text is ever parsed as HTML. */
+
+  var MD_HINT = /(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s?|```|~~~|\|.*\|)|\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|\[[^\]\n]+\]\([^)\s]+\)/;
+  function looksLikeMarkdown(text) { return typeof text === "string" && MD_HINT.test(text); }
+
+  var FENCE = /^(\s{0,3})(`{3,}|~{3,})\s*([\w+#.-]*)[^\n]*$/;
+  var HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+  var HR = /^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/;
+  var QUOTE = /^\s{0,3}>\s?(.*)$/;
+  var ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+  var EMPTY_ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s*$/;
+  var TABLE_SEP = /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+  function splitRow(line) {
+    var s = line.trim();
+    if (s.charAt(0) === "|") s = s.slice(1);
+    if (s.charAt(s.length - 1) === "|" && s.charAt(s.length - 2) !== "\\") s = s.slice(0, -1);
+    var cells = [], cur = "", inCode = false;
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+      if (ch === "\\" && s.charAt(i + 1) === "|") { cur += "|"; i++; continue; }
+      if (ch === "`") inCode = !inCode;
+      if (ch === "|" && !inCode) { cells.push(cur.trim()); cur = ""; continue; }
+      cur += ch;
+    }
+    cells.push(cur.trim());
+    return cells;
+  }
+
+  function startsBlock(line, next) {
+    return FENCE.test(line) || HEADING.test(line) || HR.test(line) || QUOTE.test(line) || ITEM.test(line) ||
+      (line.indexOf("|") >= 0 && next !== undefined && TABLE_SEP.test(next));
+  }
+
+  function indentOf(line) { var m = /^\s*/.exec(line); return m[0].replace(/\t/g, "    ").length; }
+
+  function parseBlocks(lines, depth) {
+    var blocks = [], i = 0;
+    depth = depth || 0;
+    if (depth > 12) return [{ t: "p", inl: parseInline(lines.join("\n")) }];
+    while (i < lines.length) {
+      var line = lines[i];
+      if (!line.trim()) { i++; continue; }
+      var m;
+      if ((m = FENCE.exec(line))) {
+        var fence = m[2], body = [];
+        i++;
+        while (i < lines.length && !(new RegExp("^\\s{0,3}" + fence.charAt(0) + "{" + fence.length + ",}\\s*$").test(lines[i]))) { body.push(lines[i]); i++; }
+        i++;
+        blocks.push({ t: "code", lang: m[3] || "", text: body.join("\n") });
+        continue;
+      }
+      if ((m = HEADING.exec(line))) { blocks.push({ t: "h", level: m[1].length, inl: parseInline(m[2]) }); i++; continue; }
+      if (HR.test(line)) { blocks.push({ t: "hr" }); i++; continue; }
+      if (line.indexOf("|") >= 0 && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1])) {
+        var head = splitRow(line);
+        var align = splitRow(lines[i + 1]).map(function (c) {
+          var l = c.charAt(0) === ":", r = c.charAt(c.length - 1) === ":";
+          return l && r ? "center" : r ? "right" : l ? "left" : "";
+        });
+        var rows = [];
+        i += 2;
+        while (i < lines.length && lines[i].trim() && lines[i].indexOf("|") >= 0) { rows.push(splitRow(lines[i]).map(parseInline)); i++; }
+        blocks.push({ t: "table", head: head.map(parseInline), align: align, rows: rows });
+        continue;
+      }
+      if (QUOTE.test(line)) {
+        var inner = [];
+        while (i < lines.length && (m = QUOTE.exec(lines[i]))) { inner.push(m[1]); i++; }
+        blocks.push({ t: "quote", blocks: parseBlocks(inner, depth + 1) });
+        continue;
+      }
+      if (ITEM.test(line) || EMPTY_ITEM.test(line)) {
+        var first = ITEM.exec(line) || EMPTY_ITEM.exec(line);
+        var baseIndent = indentOf(line);
+        var ordered = /\d/.test(first[2]);
+        var list = { t: ordered ? "ol" : "ul", start: ordered ? parseInt(first[2], 10) : 1, items: [] };
+        while (i < lines.length) {
+          var l = lines[i];
+          var im = ITEM.exec(l) || EMPTY_ITEM.exec(l);
+          if (!im || indentOf(l) !== baseIndent || /\d/.test(im[2]) !== ordered) break;
+          var content = [im[3] || ""];
+          var contentIndent = indentOf(l) + im[2].length + 1;
+          i++;
+          while (i < lines.length) {
+            var c = lines[i];
+            if (!c.trim()) {
+              // a blank line ends the item unless more indented text follows
+              if (i + 1 < lines.length && lines[i + 1].trim() && indentOf(lines[i + 1]) > baseIndent) { content.push(""); i++; continue; }
+              break;
+            }
+            if (indentOf(c) > baseIndent) { content.push(c.replace(/^\s+/, function (sp) { return sp.length >= contentIndent ? sp.slice(contentIndent) : ""; })); i++; continue; }
+            if (startsBlock(c, lines[i + 1])) break;
+            content.push(c.trim());   // a lazy continuation line
+            i++;
+          }
+          var task = null, firstLine = content[0];
+          var tm = /^\[([ xX])\]\s+(.*)$/.exec(firstLine);
+          if (tm) { task = tm[1] !== " "; content[0] = tm[2]; }
+          list.items.push({ task: task, blocks: parseBlocks(content, depth + 1) });
+          while (i < lines.length && !lines[i].trim()) {
+            if (i + 1 < lines.length && (ITEM.exec(lines[i + 1]) || EMPTY_ITEM.exec(lines[i + 1])) && indentOf(lines[i + 1]) === baseIndent) { i++; break; }
+            break;
+          }
+        }
+        blocks.push(list);
+        continue;
+      }
+      var para = [line];
+      i++;
+      while (i < lines.length && lines[i].trim() && !startsBlock(lines[i], lines[i + 1])) { para.push(lines[i]); i++; }
+      blocks.push({ t: "p", inl: parseInline(para.join("\n")) });
+    }
+    return blocks;
+  }
+
+  var INLINE = /(`+)([\s\S]*?[^`])\1(?!`)|\*\*(?=\S)([\s\S]*?\S)\*\*|__(?=\S)([\s\S]*?\S)__(?!\w)|~~(?=\S)([\s\S]*?\S)~~|\*(?=[^\s*])([\s\S]*?[^\s*])\*|(?:^|(?<=[^\w]))_(?=\S)([\s\S]*?\S)_(?!\w)|\[([^\]\n]+)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)|(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])|( {2,}|\\)\n|\n/g;
+
+  function parseInline(text, depth) {
+    depth = depth || 0;
+    var out = [], pos = 0, m;
+    text = String(text || "");
+    if (depth > 8) return [{ t: "text", v: text }];
+    var re = new RegExp(INLINE.source, "g");
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > pos) out.push({ t: "text", v: text.slice(pos, m.index) });
+      if (m[1]) out.push({ t: "code", v: m[2].replace(/^ (.*) $/, "$1") });
+      else if (m[3] !== undefined) out.push({ t: "b", c: parseInline(m[3], depth + 1) });
+      else if (m[4] !== undefined) out.push({ t: "b", c: parseInline(m[4], depth + 1) });
+      else if (m[5] !== undefined) out.push({ t: "s", c: parseInline(m[5], depth + 1) });
+      else if (m[6] !== undefined) out.push({ t: "i", c: parseInline(m[6], depth + 1) });
+      else if (m[7] !== undefined) out.push({ t: "i", c: parseInline(m[7], depth + 1) });
+      else if (m[8] !== undefined) out.push({ t: "a", href: m[9], c: parseInline(m[8], depth + 1) });
+      else if (m[10] !== undefined) out.push({ t: "a", href: m[10], c: [{ t: "text", v: m[10] }] });
+      else out.push({ t: "br" });
+      pos = re.lastIndex;
+      if (m[0] === "") re.lastIndex++;
+    }
+    if (pos < text.length) out.push({ t: "text", v: text.slice(pos) });
+    return out;
+  }
+
+  function markdown(text) {
+    return parseBlocks(String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n"), 0);
+  }
+
+  var api = { tokens: tokens, lines: lines, langFor: langFor, sniff: sniff, diffLines: diffLines, languages: Object.keys(LANGS),
+              markdown: markdown, parseInline: parseInline, looksLikeMarkdown: looksLikeMarkdown };
   root.WWHighlight = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof window !== "undefined" ? window : globalThis);
@@ -3074,7 +3248,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     depth = depth || 0;
     if (v === null) return el("span", { class: "val-lit", text: "null" });
     if (typeof v === "string") {
-      return el("div", { class: "val-str", text: v });
+      return richText(v);
     }
     if (typeof v !== "object") return el("span", { class: "val-lit", text: String(v) });
     if (depth > 8) return el("pre", { text: JSON.stringify(v, null, 1) });
@@ -3883,6 +4057,76 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     }
   }
 
+  /* Markdown to DOM. Every text goes in through textContent; links open
+     only http(s) addresses, in a new tab, without a referrer. */
+  function renderInline(parent, nodes) {
+    (nodes || []).forEach(function (n) {
+      if (n.t === "text") parent.appendChild(document.createTextNode(n.v));
+      else if (n.t === "code") parent.appendChild(el("code", { class: "md-code", text: n.v }));
+      else if (n.t === "br") parent.appendChild(el("br"));
+      else if (n.t === "b" || n.t === "i" || n.t === "s") {
+        var tag = n.t === "b" ? "strong" : n.t === "i" ? "em" : "del";
+        var w = el(tag); renderInline(w, n.c); parent.appendChild(w);
+      } else if (n.t === "a") {
+        var safe = /^https?:\/\//i.test(n.href || "");
+        var a = safe ? el("a", { href: n.href, target: "_blank", rel: "noopener noreferrer", title: n.href }) : el("span", { class: "md-link", title: n.href || "" });
+        renderInline(a, n.c); parent.appendChild(a);
+      }
+    });
+  }
+
+  function renderBlocks(parent, blocks) {
+    blocks.forEach(function (b) {
+      if (b.t === "p") { var p = el("p"); renderInline(p, b.inl); parent.appendChild(p); }
+      else if (b.t === "h") { var h = el("h" + Math.min(6, b.level + 2 > 6 ? 6 : b.level + 2), { class: "md-h md-h" + b.level }); renderInline(h, b.inl); parent.appendChild(h); }
+      else if (b.t === "hr") parent.appendChild(el("hr"));
+      else if (b.t === "code") {
+        var lang = b.lang ? (H.langFor("x." + b.lang) || (H.languages.indexOf(b.lang) >= 0 ? b.lang : null)) : H.sniff(b.text);
+        if (b.lang === "diff") parent.appendChild(codeBlock(b.text, { lang: null, lineNumbers: false, rowClass: function () { return ""; } }));
+        else parent.appendChild(codeBlock(b.text, { lang: lang, lineNumbers: false }));
+      } else if (b.t === "quote") { var q = el("blockquote"); renderBlocks(q, b.blocks); parent.appendChild(q); }
+      else if (b.t === "ul" || b.t === "ol") {
+        var list = el(b.t, b.t === "ol" && b.start !== 1 ? { start: String(b.start) } : null);
+        b.items.forEach(function (item) {
+          var li = el("li", item.task !== null ? { class: "md-task" } : null);
+          if (item.task !== null) li.appendChild(el("span", { class: "md-check" + (item.task ? " on" : ""), text: item.task ? "☑" : "☐" }));
+          // a single paragraph in an item is shown without its margins
+          if (item.blocks.length && item.blocks[0].t === "p") {
+            var first = el("span"); renderInline(first, item.blocks[0].inl); li.appendChild(first);
+            renderBlocks(li, item.blocks.slice(1));
+          } else renderBlocks(li, item.blocks);
+          list.appendChild(li);
+        });
+        parent.appendChild(list);
+      } else if (b.t === "table") {
+        var table = el("table", { class: "md-table" }), thead = el("thead"), tr = el("tr");
+        b.head.forEach(function (cell, i) { var th = el("th", b.align[i] ? { style: "text-align:" + b.align[i] } : null); renderInline(th, cell); tr.appendChild(th); });
+        thead.appendChild(tr); table.appendChild(thead);
+        var tbody = el("tbody");
+        b.rows.forEach(function (row) {
+          var r = el("tr");
+          b.head.forEach(function (_, i) { var td = el("td", b.align[i] ? { style: "text-align:" + b.align[i] } : null); renderInline(td, row[i] || []); r.appendChild(td); });
+          tbody.appendChild(r);
+        });
+        table.appendChild(tbody);
+        parent.appendChild(el("div", { class: "md-table-wrap" }, [table]));
+      }
+    });
+  }
+
+  function renderMarkdown(text) {
+    var box = el("div", { class: "md" });
+    try { renderBlocks(box, H.markdown(text)); }
+    catch (e) { box.appendChild(el("div", { class: "val-str", text: String(text) })); }
+    return box;
+  }
+
+  /* Text from an agent: Markdown when it looks like Markdown, else as is. */
+  function richText(text) {
+    text = String(text == null ? "" : text);
+    return H.looksLikeMarkdown(text) ? renderMarkdown(text) : el("div", { class: "val-str", text: text });
+  }
+
   // --------------------------------------------------------- tool views
   /* Each tool call is shown in a form that fits it: a terminal for Bash, a
      diff for Edit, a code file for Read and Write, a form for the rest.
@@ -3952,7 +4196,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
 
   function label(text) { return el("div", { class: "tlabel", text: text }); }
 
-  function proseBlock(text) { return el("div", { class: "prose", text: String(text || "") }); }
+  function proseBlock(text) { return el("div", { class: "prose" }, [richText(text)]); }
 
   /* Split "Exit code 2\n..." and the reminders Claude Code appends. */
   function splitResult(text) {
@@ -4122,7 +4366,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     if (d.isError) { parts.push(errorBox(d.result)); return parts; }
     var r = splitResult(d.result);
     parts.push(label(name === "WebSearch" ? "Results" : "Answer"));
-    parts.push(codeBlock(r.text, { lang: "markdown", lineNumbers: false, maxLines: 200, rowClass: function () { return "wrapline"; } }));
+    parts.push(el("div", { class: "box" }, [renderMarkdown(r.text)]));
     resultNotes(parts, r.notes);
     return parts;
   }
@@ -4143,7 +4387,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     if (inp.description) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "task" }), el("b", { text: inp.description })]));
     if (inp.subagent_type) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "type" }), chip(inp.subagent_type)]));
     parts.push(form);
-    if (inp.prompt) { parts.push(label("Prompt")); parts.push(codeBlock(inp.prompt, { lang: "markdown", lineNumbers: false, maxLines: 120, rowClass: function () { return "wrapline"; } })); }
+    if (inp.prompt) { parts.push(label("Prompt")); parts.push(el("div", { class: "box" }, [renderMarkdown(inp.prompt)])); }
     genericResult(parts, d);
     return parts;
   }
@@ -4241,7 +4485,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
       var parts;
       if (d.kind === "tool") parts = viewTool(d);
       else if (d.kind === "text" || d.kind === "thinking" || d.kind === "user" || d.kind === "system")
-        parts = [el("div", { class: "prose" + (d.kind === "thinking" ? " sub" : "") }, [codeBlockOrProse(d.text)])];
+        parts = [el("div", { class: d.kind === "thinking" ? "sub" : "" }, [renderMarkdown(d.text)])];
       else parts = [codeBlock(String(d.text || ""), { lang: "log", lineNumbers: false })];
       parts.forEach(function (p) { box.appendChild(p); });
     }
@@ -4259,20 +4503,9 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     return box;
   }
 
-  /* An assistant message: prose, with fenced code blocks shown as code. */
-  function codeBlockOrProse(text) {
-    text = String(text || "");
-    var wrap = el("div");
-    var re = /```([\w+-]*)\n([\s\S]*?)(?:```|$)/g, pos = 0, m;
-    while ((m = re.exec(text)) !== null) {
-      if (m.index > pos) wrap.appendChild(el("div", { class: "prose", text: text.slice(pos, m.index).replace(/\n+$/, "") }));
-      var lang = m[1] ? (H.langFor("x." + m[1]) || (H.languages.indexOf(m[1]) >= 0 ? m[1] : null)) : H.sniff(m[2]);
-      wrap.appendChild(codeBlock(m[2].replace(/\n$/, ""), { lang: lang, lineNumbers: false }));
-      pos = re.lastIndex;
-    }
-    if (pos < text.length) wrap.appendChild(el("div", { class: "prose", text: text.slice(pos) }));
-    return wrap;
-  }
+  /* An assistant message or a prompt: Markdown. */
+  function codeBlockOrProse(text) { return renderMarkdown(text); }
+
 
   // first route
   route();

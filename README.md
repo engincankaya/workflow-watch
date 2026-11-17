@@ -67,7 +67,15 @@ Windows. On Windows, start it with `py workflow_watch.py`.
 - **Agent panel** (click a node or a row): what the agent does now (its last
   tool call and command, how long ago), its last message, what it returned
   (shown as readable nested lists), its prompt, and all its steps in order.
-  Thinking blocks are hidden unless you turn them on.
+  Thinking blocks are hidden unless you turn them on. The panel updates in
+  place, so what you read does not move when new steps arrive.
+- **A step, opened**: each tool in its own form, with syntax colours, never as
+  raw JSON. Bash is a terminal (the command, the exit code, the output with
+  failing and passing lines marked). Edit is a diff of the lines it changed.
+  Write and Read show the file with line numbers. Grep and Glob show what they
+  found, WebFetch and WebSearch the question and the answer, StructuredOutput
+  the returned value as nested lists. Other tools show their fields as a form.
+  The full call is read from the transcript when you open the step.
 
 A Workflow call that waits for your approval is listed as "awaiting launch",
 and its flow is drawn from the script before the run starts.
@@ -133,7 +141,8 @@ Not verified yet: how an agent that is retried after a stall, or a child
 
 - `tests/test_workflow_watch.py`: reader, status and HTTP tests on small
   invented run folders.
-- `tests/test_graph.py` with `tests/graph_cases.js`: the flow builder on
-  several script shapes (needs Node.js).
+- `tests/test_graph.py` with `tests/graph_cases.js` and
+  `tests/highlight_cases.js`: the flow builder on several script shapes, and
+  the syntax highlighter and line diff (need Node.js).
 - `tools/simulate_run.py`: an invented live run, for trying the page.
 - `tools/vendor_acorn.py`: replaces the embedded acorn parser.

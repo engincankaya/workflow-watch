@@ -34,6 +34,18 @@ class GraphCode(unittest.TestCase):
             self.assertEqual(report["failed"], [], report)
             self.assertGreater(report["passed"], 40)
 
+    def test_highlight_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            highlight = Path(tmp) / "highlight.js"
+            highlight.write_text(ww.HIGHLIGHT_JS, encoding="utf-8")
+            cases = Path(__file__).resolve().parent / "highlight_cases.js"
+            out = subprocess.run([NODE, str(cases), str(highlight)],
+                                 capture_output=True, text=True, timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            report = json.loads(out.stdout.strip().splitlines()[-1])
+            self.assertEqual(report["failed"], [], report)
+            self.assertGreater(report["passed"], 40)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -42,6 +42,10 @@ PREVIEW = 400                   # characters of a result shown in summaries
 NOTIFY_GRACE_MS = 60_000        # file activity this long after a "stopped"
                                 # report means the run is still going
 
+OFFSET_KEY = "\u0000offset"     # where a record's line starts in its file
+MAX_LINE_BYTES = 64 * 1024 * 1024
+MAX_FIELD = 400_000             # characters of one field in a step's full detail
+
 RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]+$")
 NOTIFY_FIELD_RE = {
     name: re.compile(r"<%s>(.*?)</%s>" % (name, name), re.S)
@@ -150,6 +154,47 @@ def tool_summary(name, tool_input):
     return preview(tool_input, 160) or ""
 
 
+def clip_fields(value, depth=0):
+    """A copy of a JSON value whose long strings are cut to MAX_FIELD."""
+    if isinstance(value, str):
+        return clip(value, MAX_FIELD)
+    if depth > 30:
+        return None
+    if isinstance(value, list):
+        return [clip_fields(v, depth + 1) for v in value[:5000]]
+    if isinstance(value, dict):
+        return {str(k): clip_fields(v, depth + 1) for k, v in list(value.items())[:500]}
+    return value
+
+
+def read_line_at(path, offset):
+    """The JSON object on the line that starts at ``offset``, or None."""
+    if not isinstance(offset, int) or offset < 0:
+        return None
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            line = handle.readline(MAX_LINE_BYTES)
+        value = json.loads(line.decode("utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def find_block(record, block_type, test):
+    if not isinstance(record, dict) or not isinstance(record.get("message"), dict):
+        return None
+    content = record["message"].get("content")
+    if isinstance(content, str) and block_type == "text":
+        return {"type": "text", "text": content}
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == block_type and test(block):
+            return block
+    return None
+
+
 def safe_stat(path):
     try:
         return path.stat()
@@ -230,13 +275,15 @@ class JsonlTail:
                     chunk = handle.read(READ_CHUNK)
                     if not chunk:
                         break
+                    start = self.offset - len(self.buffer)
                     self.offset += len(chunk)
                     self.bytes_read += len(chunk)
                     data = self.buffer + chunk
                     lines = data.split(b"\n")
                     self.buffer = lines.pop()
                     for line in lines:
-                        self._parse(line, records, accept)
+                        self._parse(line, records, accept, start)
+                        start += len(line) + 1
         except OSError:
             return records, reset
         self._flush_complete_buffer(records, accept)
@@ -253,10 +300,11 @@ class JsonlTail:
             return
         if isinstance(value, dict):
             if accept is None or accept(self.buffer):
+                value[OFFSET_KEY] = self.offset - len(self.buffer)
                 records.append(value)
             self.buffer = b""
 
-    def _parse(self, line, records, accept):
+    def _parse(self, line, records, accept, offset=None):
         line = line.strip()
         if not line:
             return
@@ -268,6 +316,7 @@ class JsonlTail:
             self.bad_lines += 1
             return
         if isinstance(value, dict):
+            value[OFFSET_KEY] = offset
             records.append(value)
         else:
             self.bad_lines += 1
@@ -406,6 +455,7 @@ class AgentTranscript:
         self.reset()
 
     def reset(self):
+        self._offset = None
         self.first_time = None
         self.last_time = None
         self.prompt = None
@@ -452,10 +502,13 @@ class AgentTranscript:
 
     def _add_step(self, step):
         step["i"] = len(self.steps)
+        if self._offset is not None:
+            step["off"] = self._offset
         self.steps.append(step)
         return step
 
     def _take(self, record):
+        self._offset = record.get(OFFSET_KEY)
         kind = record.get("type")
         when = iso_ms(record.get("timestamp"))
         if when and kind in ("user", "assistant", "attachment", "system"):
@@ -508,6 +561,8 @@ class AgentTranscript:
                     step["result"] = clip(text)
                     step["isError"] = is_error
                     step["end"] = when
+                    if self._offset is not None:
+                        step["roff"] = self._offset
                 else:
                     self._add_step({"kind": "tool_result", "time": when,
                                     "text": clip(text), "isError": is_error})
@@ -548,6 +603,7 @@ class AgentTranscript:
                     step["command"] = clip(tool_input.get("command"), 600)
                 if tool_id:
                     self.tool_steps[tool_id] = step["i"]
+                    step["toolId"] = tool_id
                 self.tool_calls += 1
                 self.last_tool = {"name": name, "summary": step["summary"], "time": when,
                                   "step": step["i"]}
@@ -1203,6 +1259,49 @@ class Store:
                 "phases": None, "logs": None, "result": None, "hasResult": False,
                 "notes": []}
 
+    def step_detail(self, run_id, agent_id, index):
+        """The full input and result of one step, read again from the file at
+        the place the step was found, so long texts are not kept in memory."""
+        self.refresh()
+        with self.lock:
+            run = self.runs.get(run_id)
+            transcript = run.transcripts.get(agent_id) if run else None
+            if transcript is None or not 0 <= index < len(transcript.steps):
+                return None
+            step = dict(transcript.steps[index])
+            path = transcript.tail.path
+        detail = {"i": index, "kind": step.get("kind"), "name": step.get("name"),
+                  "time": step.get("time"), "end": step.get("end"),
+                  "isError": bool(step.get("isError")), "notes": []}
+        record = read_line_at(path, step.get("off"))
+        if step.get("kind") == "tool":
+            block = find_block(record, "tool_use", lambda b: b.get("id") == step.get("toolId"))
+            if block is None:
+                detail["notes"].append("The call could not be read again from the transcript.")
+                detail["input"] = None
+            else:
+                detail["input"] = clip_fields(block.get("input"))
+            if step.get("roff") is not None:
+                result_record = read_line_at(path, step.get("roff"))
+                block = find_block(result_record, "tool_result",
+                                   lambda b: b.get("tool_use_id") == step.get("toolId"))
+                if block is not None:
+                    detail["result"] = clip(block_text(block.get("content")), MAX_FIELD)
+                    detail["isError"] = bool(block.get("is_error"))
+                    images = [b for b in block.get("content") or [] if isinstance(b, dict)
+                              and b.get("type") == "image"] if isinstance(block.get("content"), list) else []
+                    if images:
+                        detail["notes"].append("The result holds %d image(s), not shown." % len(images))
+            return detail
+        if step.get("kind") in ("text", "thinking"):
+            key = "text" if step["kind"] == "text" else "thinking"
+            block = find_block(record, step["kind"], lambda b: isinstance(b.get(key), str)
+                               and b.get(key)[:200] == (step.get("text") or "")[:200])
+            detail["text"] = clip(block.get(key), MAX_FIELD) if block else step.get("text")
+            return detail
+        detail["text"] = step.get("text")
+        return detail
+
     def agent_detail(self, run_id, agent_id, start_step=0):
         self.refresh()
         now_ms = time.time() * 1000
@@ -1299,6 +1398,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, APP_CSS, "text/css; charset=utf-8")
             elif path == "/app.js":
                 self._send(200, APP_JS, "text/javascript; charset=utf-8")
+            elif path == "/highlight.js":
+                self._send(200, HIGHLIGHT_JS, "text/javascript; charset=utf-8")
             elif path == "/graph.js":
                 self._send(200, GRAPH_JS, "text/javascript; charset=utf-8")
             elif path == "/acorn.js":
@@ -1312,6 +1413,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/static":
                 data = self.store.run_static(arg("id", ""))
                 self._json(data if data is not None else {"error": "unknown run"},
+                           200 if data is not None else 404)
+            elif path == "/api/step":
+                try:
+                    index = int(arg("i", "-1"))
+                except ValueError:
+                    index = -1
+                data = self.store.step_detail(arg("run", ""), arg("agent", ""), index)
+                self._json(data if data is not None else {"error": "unknown step"},
                            200 if data is not None else 404)
             elif path == "/api/agent":
                 try:
@@ -1413,6 +1522,7 @@ INDEX_HTML = """<!doctype html>
 <main id="main"></main>
 <aside id="drawer" class="drawer" hidden></aside>
 <script src="/acorn.js"></script>
+<script src="/highlight.js"></script>
 <script src="/graph.js"></script>
 <script src="/app.js"></script>
 </body>
@@ -1603,7 +1713,7 @@ table.grid tr.is-running td:first-child { box-shadow: inset 3px 0 0 var(--run); 
 .drawer[hidden] { display: none; }
 .drawer .dhead { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: flex-start; }
 .drawer .dhead h3 { margin: 0; font-size: 16px; word-break: break-all; }
-.drawer .dbody { overflow: auto; padding: 12px 16px 40px; flex: 1; }
+.drawer .dbody { overflow: auto; overflow-anchor: auto; padding: 12px 16px 40px; flex: 1; }
 .drawer h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 18px 0 6px; }
 .now-box { border: 1.5px solid var(--run); background: var(--run-bg); border-radius: 8px; padding: 8px 10px; }
 .now-box.quiet { border-color: var(--quiet); background: var(--quiet-bg); }
@@ -1613,9 +1723,10 @@ table.grid tr.is-running td:first-child { box-shadow: inset 3px 0 0 var(--run); 
 .steps li { border-bottom: 1px solid var(--line); padding: 5px 0; }
 .steps .srow { display: flex; gap: 8px; align-items: baseline; cursor: pointer; }
 .steps .stime { color: var(--faint); font-size: 11.5px; font-variant-numeric: tabular-nums; flex: none; width: 64px; }
-.steps .skind { font-size: 11px; font-weight: 600; flex: none; width: 74px; color: var(--muted); }
+.steps .skind { font-size: 11px; font-weight: 600; flex: none; min-width: 74px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .steps .stext { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .steps li.open .stext { white-space: normal; }
+.steps li.open.k-tool .stext { white-space: nowrap; }
 .steps .sdetail { margin: 6px 0 4px 82px; background: var(--code-bg); border-radius: 6px; padding: 6px 8px; max-height: 420px; overflow: auto; }
 .steps li.err .skind, .steps li.err .stext { color: var(--fail); }
 .steps li.k-text .stext { color: var(--text); }
@@ -1640,6 +1751,362 @@ details[open] > summary { margin-bottom: 6px; }
   .hide-sm { display: none; }
   .steps .sdetail { margin-left: 0; }
 }
+
+/* ---- code, terminal, diff ---- */
+:root {
+  --tk-keyword: #cf222e; --tk-string: #0a3069; --tk-comment: #6e7781; --tk-number: #0550ae;
+  --tk-fn: #8250df; --tk-type: #953800; --tk-prop: #0550ae; --tk-literal: #0550ae; --tk-builtin: #8250df;
+  --tk-var: #953800; --tk-tag: #116329; --tk-attr: #0550ae; --tk-op: #cf222e; --tk-deco: #8250df;
+  --tk-add: #1a7f37; --tk-del: #cf222e; --tk-warn: #9a6700;
+  --code-text: #1f2328; --code-bg2: #f6f8fa; --code-line: #d0d7de; --ln: #8c959f;
+  --add-bg: #dafbe1; --del-bg: #ffebe9; --add-sign: #1a7f37; --del-sign: #cf222e;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tk-keyword: #ff7b72; --tk-string: #a5d6ff; --tk-comment: #8b949e; --tk-number: #79c0ff;
+    --tk-fn: #d2a8ff; --tk-type: #ffa657; --tk-prop: #79c0ff; --tk-literal: #79c0ff; --tk-builtin: #d2a8ff;
+    --tk-var: #ffa657; --tk-tag: #7ee787; --tk-attr: #79c0ff; --tk-op: #ff7b72; --tk-deco: #d2a8ff;
+    --tk-add: #3fb950; --tk-del: #f85149; --tk-warn: #d29922;
+    --code-text: #e6edf3; --code-bg2: #0d1117; --code-line: #30363d; --ln: #6e7681;
+    --add-bg: rgba(46, 160, 67, .18); --del-bg: rgba(248, 81, 73, .18); --add-sign: #3fb950; --del-sign: #f85149;
+  }
+}
+:root[data-theme="dark"] {
+  --tk-keyword: #ff7b72; --tk-string: #a5d6ff; --tk-comment: #8b949e; --tk-number: #79c0ff;
+  --tk-fn: #d2a8ff; --tk-type: #ffa657; --tk-prop: #79c0ff; --tk-literal: #79c0ff; --tk-builtin: #d2a8ff;
+  --tk-var: #ffa657; --tk-tag: #7ee787; --tk-attr: #79c0ff; --tk-op: #ff7b72; --tk-deco: #d2a8ff;
+  --tk-add: #3fb950; --tk-del: #f85149; --tk-warn: #d29922;
+  --code-text: #e6edf3; --code-bg2: #0d1117; --code-line: #30363d; --ln: #6e7681;
+  --add-bg: rgba(46, 160, 67, .18); --del-bg: rgba(248, 81, 73, .18); --add-sign: #3fb950; --del-sign: #f85149;
+}
+/* the terminal is dark in both themes */
+.terminal, .code.term {
+  --tk-keyword: #ff7b72; --tk-string: #a5d6ff; --tk-comment: #8b949e; --tk-number: #79c0ff;
+  --tk-fn: #7ee787; --tk-type: #ffa657; --tk-prop: #79c0ff; --tk-literal: #79c0ff; --tk-builtin: #d2a8ff;
+  --tk-var: #ffa657; --tk-tag: #7ee787; --tk-attr: #79c0ff; --tk-op: #ff7b72; --tk-deco: #d2a8ff;
+  --tk-add: #3fb950; --tk-del: #ff7b72; --tk-warn: #e3b341;
+  --code-text: #e6edf3; --code-bg2: #0d1117; --code-line: #30363d; --ln: #6e7681;
+}
+.code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.5;
+  background: var(--code-bg2); color: var(--code-text); border: 1px solid var(--code-line); border-radius: 8px;
+  overflow: auto; max-height: 560px; margin: 6px 0; }
+.code-body { display: table; min-width: 100%; padding: 6px 0; }
+.code .cl { display: table-row; }
+.code .ln { display: table-cell; text-align: right; padding: 0 10px 0 12px; color: var(--ln); user-select: none;
+  min-width: 2.5em; white-space: nowrap; border-right: 1px solid var(--code-line); }
+.code .lc { display: table-cell; padding: 0 12px; white-space: pre; tab-size: 4; }
+.code .cl.wrapline .lc { white-space: pre-wrap; word-break: break-word; }
+.code.term { background: transparent; border: none; margin: 0; max-height: 480px; }
+.code.cmd .cl:first-child .lc::before { content: "$ "; color: #7ee787; font-weight: 600; }
+.code.cmd .lc { white-space: pre-wrap; word-break: break-word; }
+.code .more { display: block; margin: 4px 12px 10px; font-size: 12px; }
+.terminal { background: #0d1117; color: #e6edf3; border-radius: 8px; border: 1px solid #30363d; padding: 4px 0; margin: 6px 0; }
+.terminal .code.term + .code.term, .terminal .texit + .code.term { border-top: 1px solid #30363d; }
+.texit { font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #3fb950; padding: 4px 12px 0; }
+.texit.bad { color: #ff7b72; }
+.term-pending { color: #8b949e; padding: 4px 12px 6px; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.tk-keyword { color: var(--tk-keyword); } .tk-string { color: var(--tk-string); }
+.tk-comment { color: var(--tk-comment); font-style: italic; } .tk-number { color: var(--tk-number); }
+.tk-fn { color: var(--tk-fn); } .tk-type { color: var(--tk-type); } .tk-prop { color: var(--tk-prop); }
+.tk-literal { color: var(--tk-literal); } .tk-builtin { color: var(--tk-builtin); } .tk-var { color: var(--tk-var); }
+.tk-tag { color: var(--tk-tag); } .tk-attr { color: var(--tk-attr); } .tk-op { color: var(--tk-op); }
+.tk-deco { color: var(--tk-deco); } .tk-add { color: var(--tk-add); } .tk-del { color: var(--tk-del); }
+.tk-warn { color: var(--tk-warn); }
+.diff .dadd-row { background: var(--add-bg); } .diff .ddel-row { background: var(--del-bg); }
+.diff .dadd-row .dsign { color: var(--add-sign); font-weight: 700; } .diff .ddel-row .dsign { color: var(--del-sign); font-weight: 700; }
+.diff .dskip .lc { color: var(--ln); font-style: italic; }
+.dstat { font: 600 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.dadd { color: var(--add-sign); } .ddel { color: var(--del-sign); }
+
+.fhead { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px 8px 0 0; padding: 6px 10px; margin-top: 6px; }
+.fhead + .code { border-top-left-radius: 0; border-top-right-radius: 0; margin-top: 0; border-top: none; }
+.fdir { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.fname { font-weight: 700; color: var(--text); }
+.fchips { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; padding-left: 10px; }
+.tchip { display: inline-block; font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 1px 8px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); margin-right: 4px; }
+.tchip.ok { color: var(--run); border-color: var(--run); } .tchip.bad { color: var(--fail); border-color: var(--fail); }
+.tdesc { font-weight: 600; margin: 2px 0 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.tlabel { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 10px 0 2px; font-weight: 600; }
+.tform { display: grid; gap: 4px; margin: 4px 0; }
+.trow { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.trow.tcol { display: block; }
+.trow .tk { font-size: 12px; color: var(--muted); min-width: 64px; font-weight: 600; }
+.tpat { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-bg2); color: var(--tk-string);
+  border: 1px solid var(--code-line); border-radius: 5px; padding: 1px 6px; }
+.prose { white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+.terr { margin: 6px 0; } .terr .code { border-color: var(--fail); }
+.tpending { color: var(--muted); font-style: italic; margin: 6px 0; }
+.ttime { color: var(--faint); font-size: 11.5px; margin-top: 6px; }
+.rnotes { margin: 6px 0; } .rnotes summary { font-size: 12px; }
+.todos { list-style: none; margin: 4px 0; padding: 0; } .todos li { display: flex; gap: 8px; padding: 2px 0; }
+.todos .todo-completed { color: var(--muted); text-decoration: line-through; } .todos .todo-in_progress { font-weight: 600; }
+.now-box .code { max-height: 220px; }
+.steps .sdetail { background: transparent; padding: 4px 0 8px; max-height: none; overflow: visible; margin-left: 82px; }
+.steps .skind.tool-bash { color: #2da44e; } .steps .skind.tool-edit, .steps .skind.tool-multiedit { color: #bf8700; }
+.steps .skind.tool-write { color: #8250df; } .steps .skind.tool-read { color: #0969da; }
+.steps .skind.tool-grep, .steps .skind.tool-glob { color: #1b7c83; } .steps .skind.tool-structuredoutput { color: var(--done); }
+@media (max-width: 720px) { .steps .sdetail { margin-left: 0; } }
+"""
+
+HIGHLIGHT_JS = r"""/* workflow-watch: a small syntax highlighter and line diff. It returns
+   tokens ({c: class, t: text}); the page turns them into spans with
+   textContent, so no text is ever parsed as HTML. */
+(function (root) {
+  "use strict";
+
+  var MAX_HIGHLIGHT = 400000;   // characters; longer text stays plain
+
+  function words(list) { return "\\b(?:" + list.split(/\s+/).filter(Boolean).join("|") + ")\\b"; }
+
+  var STR_D = '"(?:\\\\.|[^"\\\\\\n])*"?';
+  var STR_S = "'(?:\\\\.|[^'\\\\\\n])*'?";
+  var NUM = "\\b(?:0[xX][\\da-fA-F_]+|0[oObB][0-7_]+|\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?[jJnLlfFuU]*)\\b";
+  var FN = "\\b[A-Za-z_$][\\w$]*(?=\\s*\\()";
+  var TYPE = "\\b[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*\\b";
+  var END = "(?![\\s\\S])";   // end of the whole text; $ is the end of a line with the m flag
+  var C_BLOCK = "/\\*[\\s\\S]*?(?:\\*/|" + END + ")";
+  var C_LINE = "//[^\\n]*";
+
+  var LANGS = {
+    python: [
+      ["comment", "#[^\\n]*"],
+      ["string", "[rRbBuUfF]{0,2}\"\"\"[\\s\\S]*?(?:\"\"\"|" + END + ")|[rRbBuUfF]{0,2}'''[\\s\\S]*?(?:'''|" + END + ")"],
+      ["string", "[rRbBuUfF]{0,2}" + STR_D + "|[rRbBuUfF]{0,2}" + STR_S],
+      ["deco", "@[\\w.]+"],
+      ["keyword", words("and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case")],
+      ["literal", words("True False None self cls")],
+      ["builtin", words("print len range list dict set tuple str int float bool open isinstance super enumerate zip map filter sorted any all min max sum repr type getattr setattr hasattr")],
+      ["number", NUM],
+      ["fn", FN],
+      ["type", TYPE],
+      ["op", "->|:=|[=!<>]=?|[-+*/%&|^~]=?"],
+    ],
+    js: [
+      ["comment", C_LINE + "|" + C_BLOCK],
+      ["string", "`(?:\\\\[\\s\\S]|[^\\\\`])*`?"],
+      ["string", STR_D + "|" + STR_S],
+      ["keyword", words("async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof var void while with yield as interface type enum implements declare readonly keyof namespace abstract private protected public satisfies")],
+      ["literal", words("true false null undefined NaN Infinity")],
+      ["builtin", words("string number boolean any unknown never object console Promise Array Object JSON Math Map Set Error")],
+      ["number", NUM],
+      ["tag", "</?[A-Z][\\w.]*|</?[a-z][\\w-]*(?=[\\s/>])"],
+      ["fn", FN],
+      ["type", TYPE],
+      ["op", "=>|[=!<>]=?=?|&&|\\|\\||\\?\\?|[-+*/%&|^~]=?|\\.\\.\\."],
+    ],
+    json: [
+      ["prop", "\"(?:\\\\.|[^\"\\\\\\n])*\"(?=\\s*:)"],
+      ["string", STR_D],
+      ["literal", words("true false null")],
+      ["number", "-?" + NUM],
+    ],
+    bash: [
+      ["comment", "(?:^|(?<=\\s))#[^\\n]*"],
+      ["string", "'[^']*'?"],
+      ["string", "\"(?:\\\\.|[^\"\\\\])*\"?"],
+      ["var", "\\$\\{[^}\\n]*\\}?|\\$\\(\\(|\\$[A-Za-z_][\\w]*|\\$[@*#?$!0-9]"],
+      ["keyword", words("if then else elif fi for while until do done case esac in function select return export local readonly unset set source alias time")],
+      ["var", "(?<=(?:^|[|;&({`\\s]))[A-Za-z_]\\w*(?==)"],
+      ["fn", "(?<=(?:^|[|;&({`]|\\$\\(|&&|\\|\\|)\\s*(?:[A-Za-z_]\\w*=\\S*\\s+)*(?:sudo\\s+|env\\s+|exec\\s+|time\\s+)?)[A-Za-z_./~][\\w./~+-]*"],
+      ["attr", "(?<=\\s)--?[A-Za-z0-9][\\w-]*"],
+      ["number", "(?<=[\\s=:])\\d+\\b"],
+      ["op", "&&|\\|\\||[|;&<>]+|\\\\$"],
+    ],
+    css: [
+      ["comment", C_BLOCK],
+      ["string", STR_D + "|" + STR_S],
+      ["keyword", "@[\\w-]+|!important"],
+      ["prop", "[\\w-]+(?=\\s*:[^:{])"],
+      ["number", "#[\\da-fA-F]{3,8}\\b|-?\\d*\\.?\\d+(?:px|em|rem|vh|vw|%|s|ms|fr|deg)?\\b"],
+      ["fn", FN],
+      ["tag", "[.#][\\w-]+"],
+    ],
+    html: [
+      ["comment", "<!--[\\s\\S]*?(?:-->|" + END + ")"],
+      ["tag", "</?[\\w:.-]+|/?>"],
+      ["attr", "[\\w:@.-]+(?==)"],
+      ["string", STR_D + "|" + STR_S],
+    ],
+    yaml: [
+      ["comment", "(?:^|(?<=\\s))#[^\\n]*"],
+      ["keyword", "^\\s*\\[[^\\]\\n]+\\]"],
+      ["prop", "^[ \\t-]*[\\w.\\-\"' /]+?(?=\\s*[:=](?:\\s|$))"],
+      ["string", STR_D + "|" + STR_S],
+      ["literal", words("true false null yes no on off True False")],
+      ["number", NUM],
+      ["op", "^\\s*-(?=\\s)|[|>]-?$"],
+    ],
+    sql: [
+      ["comment", "--[^\\n]*|" + C_BLOCK],
+      ["string", STR_S],
+      ["prop", "\"(?:[^\"\\n])*\""],
+      ["keyword", words("select from where and or not insert into values update set delete create table index view drop alter add column primary key foreign references join left right inner outer full on group by order having limit offset as distinct union all case when then else end is null in exists between like returning begin commit rollback with for share nowait skip locked constraint default unique check cascade grant revoke trigger function")],
+      ["number", NUM],
+      ["fn", FN],
+    ],
+    markdown: [
+      ["keyword", "^#{1,6}\\s[^\\n]*"],
+      ["string", "```[\\s\\S]*?(?:```|" + END + ")|`[^`\\n]+`"],
+      ["type", "\\*\\*[^*\\n]+\\*\\*|__[^_\\n]+__"],
+      ["fn", "\\[[^\\]\\n]+\\]\\([^)\\n]+\\)"],
+      ["op", "^\\s*(?:[-*+]|\\d+\\.)\\s|^\\s*>"],
+    ],
+    clike: [
+      ["comment", C_LINE + "|" + C_BLOCK + "|(?:^|(?<=\\s))#(?![\\[!{])[^\\n]*"],
+      ["string", "\"\"\"[\\s\\S]*?(?:\"\"\"|" + END + ")|`[^`]*`?"],
+      ["string", STR_D + "|" + STR_S],
+      ["keyword", words("abstract as async await break case catch chan class const continue def default defer do else elif elsif end enum export extends extern final finally fn for foreach func go goto if impl implements import in interface internal let loop match mod module mut namespace new nil override package private protected pub public range rescue return select self sealed static struct super switch synchronized template this throw throws trait try type typedef union unless unsafe use using val var virtual void volatile when where while yield")],
+      ["literal", words("true false null nil None NULL nullptr")],
+      ["builtin", words("int long short char byte float double bool boolean string String usize isize u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 error any")],
+      ["number", NUM],
+      ["fn", FN],
+      ["type", TYPE],
+      ["op", "=>|->|::|[=!<>]=?|&&|\\|\\||[-+*/%&|^~]=?"],
+    ],
+    grep: [
+      ["tag", "^[^\\n:]+?(?=:\\d+[:-]|$)"],
+      ["number", "(?<=^[^\\n:]+?:)\\d+(?=[:-])"],
+    ],
+    log: [
+      // only lines that look like test or tool output, not every sentence with "error" in it
+      ["del", "^.*(?:\\bFAILED\\b|\\bFAIL\\b|\\bERROR\\b|^E {2,}|Traceback \\(most recent call last\\)|\\b[A-Z]\\w*(?:Error|Exception)\\b|\\b[1-9]\\d* (?:failed|errors?)\\b|^(?:error|fatal|panic)\\b|✖|✗).*$"],
+      ["add", "^.*(?:\\bPASSED\\b|\\bPASS\\b|\\b\\d+ passed\\b|^OK\\b|✔|✓).*$"],
+      ["warn", "^.*(?:\\bWARN(?:ING)?\\b|^warning:|\\b\\w*Warning\\b|\\bSKIPPED\\b|\\b\\d+ skipped\\b).*$"],
+    ],
+  };
+  LANGS.ts = LANGS.js;
+
+  var EXT = {
+    py: "python", pyi: "python", pyw: "python",
+    js: "js", mjs: "js", cjs: "js", jsx: "js", ts: "js", tsx: "js", mts: "js", cts: "js", vue: "html", svelte: "html",
+    json: "json", jsonl: "json", jsonc: "js", map: "json", lock: "json",
+    sh: "bash", bash: "bash", zsh: "bash", fish: "bash", env: "bash",
+    css: "css", scss: "css", sass: "css", less: "css",
+    html: "html", htm: "html", xml: "html", svg: "html", xhtml: "html",
+    yml: "yaml", yaml: "yaml", toml: "yaml", ini: "yaml", cfg: "yaml", conf: "yaml", properties: "yaml",
+    sql: "sql", psql: "sql",
+    md: "markdown", markdown: "markdown", mdx: "markdown", rst: "markdown", txt: null,
+    go: "clike", java: "clike", kt: "clike", kts: "clike", c: "clike", h: "clike", cc: "clike", cpp: "clike",
+    hpp: "clike", cs: "clike", rs: "clike", swift: "clike", scala: "clike", rb: "clike", php: "clike",
+    dart: "clike", groovy: "clike", gradle: "clike", m: "clike", lua: "clike", r: "clike", pl: "clike",
+    tf: "clike", proto: "clike", graphql: "clike", gql: "clike",
+  };
+  var NAMES = { dockerfile: "bash", makefile: "bash", ".bashrc": "bash", ".zshrc": "bash", ".env": "bash",
+                ".gitignore": "bash", "requirements.txt": "yaml" };
+
+  function langFor(path) {
+    if (!path) return null;
+    var name = String(path).split(/[\\/]/).pop().toLowerCase();
+    if (NAMES[name] !== undefined) return NAMES[name];
+    if (/^dockerfile/.test(name)) return "bash";
+    if (/^\.env/.test(name)) return "bash";
+    var dot = name.lastIndexOf(".");
+    if (dot < 0) return null;
+    var ext = name.slice(dot + 1);
+    return EXT[ext] !== undefined ? EXT[ext] : null;
+  }
+
+  /* Guess a language for text that has no file name. */
+  function sniff(text) {
+    var head = String(text || "").slice(0, 2000).trim();
+    if (!head) return null;
+    if (/^[\[{]/.test(head)) { try { JSON.parse(text); return "json"; } catch (e) { /* not JSON */ } }
+    if (/^(?:def |class |import |from \w+ import |@\w)/m.test(head) && /:\s*$/m.test(head)) return "python";
+    if (/^(?:const |let |var |import |export |function |async function )/m.test(head)) return "js";
+    if (/^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|WITH)\b/i.test(head)) return "sql";
+    if (/^<(?:!doctype|html|\?xml|svg|div)/i.test(head)) return "html";
+    if (/^#{1,6} /m.test(head)) return "markdown";
+    return null;
+  }
+
+  var compiled = {};
+  function regexFor(lang) {
+    if (compiled[lang]) return compiled[lang];
+    var rules = LANGS[lang];
+    var source = rules.map(function (r) { return "(" + r[1] + ")"; }).join("|");
+    var flags = "gm" + (lang === "sql" ? "i" : "");
+    var re;
+    try { re = new RegExp(source, flags); }
+    catch (e) {   // a browser without lookbehind: drop the rules that use it
+      var safe = rules.filter(function (r) { return r[1].indexOf("(?<") < 0; });
+      rules = safe;
+      re = new RegExp(safe.map(function (r) { return "(" + r[1] + ")"; }).join("|"), flags);
+    }
+    compiled[lang] = { re: re, classes: rules.map(function (r) { return r[0]; }) };
+    return compiled[lang];
+  }
+
+  /* Tokens of a text: [{c: class or "", t: text}]. */
+  function tokens(text, lang) {
+    text = String(text == null ? "" : text);
+    if (!lang || !LANGS[lang] || text.length > MAX_HIGHLIGHT) return [{ c: "", t: text }];
+    var rx = regexFor(lang), re = rx.re, out = [], pos = 0, m;
+    re.lastIndex = 0;
+    while ((m = re.exec(text)) !== null) {
+      if (m[0] === "") { re.lastIndex++; continue; }
+      if (m.index > pos) out.push({ c: "", t: text.slice(pos, m.index) });
+      var cls = "";
+      for (var g = 1; g < m.length; g++) if (m[g] !== undefined) { cls = rx.classes[g - 1]; break; }
+      out.push({ c: cls, t: m[0] });
+      pos = m.index + m[0].length;
+    }
+    if (pos < text.length) out.push({ c: "", t: text.slice(pos) });
+    return out;
+  }
+
+  /* Tokens split into lines: [[{c, t}, ...], ...]. */
+  function lines(text, lang) {
+    var result = [[]];
+    tokens(text, lang).forEach(function (tok) {
+      var parts = tok.t.split("\n");
+      parts.forEach(function (part, i) {
+        if (i > 0) result.push([]);
+        if (part) result[result.length - 1].push({ c: tok.c, t: part });
+      });
+    });
+    return result;
+  }
+
+  /* Line diff of two texts (longest common subsequence). Returns rows
+     {k: " " | "-" | "+", a: old line index or null, b: new line index or null}. */
+  function diffLines(oldText, newText) {
+    var a = String(oldText || "").split("\n"), b = String(newText || "").split("\n");
+    var start = 0;
+    while (start < a.length && start < b.length && a[start] === b[start]) start++;
+    var endA = a.length, endB = b.length;
+    while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+    var rows = [], i;
+    for (i = 0; i < start; i++) rows.push({ k: " ", a: i, b: i });
+    var n = endA - start, m = endB - start, middle = [];
+    if (n * m > 4000000) {
+      for (i = start; i < endA; i++) middle.push({ k: "-", a: i, b: null });
+      for (i = start; i < endB; i++) middle.push({ k: "+", a: null, b: i });
+    } else {
+      var table = [];
+      for (i = 0; i <= n; i++) table.push(new Uint32Array(m + 1));
+      for (i = n - 1; i >= 0; i--) {
+        for (var j = m - 1; j >= 0; j--) {
+          table[i][j] = a[start + i] === b[start + j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+        }
+      }
+      var x = 0, y = 0;
+      while (x < n || y < m) {
+        if (x < n && y < m && a[start + x] === b[start + y]) { middle.push({ k: " ", a: start + x, b: start + y }); x++; y++; }
+        else if (x < n && (y >= m || table[x + 1][y] >= table[x][y + 1])) { middle.push({ k: "-", a: start + x, b: null }); x++; }
+        else { middle.push({ k: "+", a: null, b: start + y }); y++; }
+      }
+    }
+    rows = rows.concat(middle);
+    for (i = 0; endA + i < a.length; i++) rows.push({ k: " ", a: endA + i, b: endB + i });
+    return rows;
+  }
+
+  var api = { tokens: tokens, lines: lines, langFor: langFor, sniff: sniff, diffLines: diffLines, languages: Object.keys(LANGS) };
+  root.WWHighlight = api;
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+})(typeof window !== "undefined" ? window : globalThis);
 """
 
 GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, match the run's
@@ -3163,6 +3630,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     var d = document.getElementById("drawer");
     d.hidden = true;
     clear(d);
+    drawer.dom = null;
     clearTimeout(drawer.timer);
     var cb = drawer.onClose;
     drawer.run = null; drawer.onClose = null;
@@ -3200,7 +3668,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
 
   function selectAgent(agentId) {
     clearTimeout(drawer.timer);
-    drawer.agentId = agentId; drawer.steps = []; drawer.from = 0; drawer.data = null;
+    drawer.agentId = agentId; drawer.steps = []; drawer.from = 0; drawer.data = null; drawer.dom = null;
     var d = document.getElementById("drawer");
     d.hidden = false;
     renderDrawer();
@@ -3231,139 +3699,579 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
       });
   }
 
-  function renderDrawer() {
+  /* The panel is built once per agent and then updated in place. Rebuilding
+     it on every poll moved what the reader was looking at; now only the parts
+     that changed are replaced, new steps are appended at the end, and the
+     browser's scroll anchoring keeps the reader's place. */
+  function drawerSkeleton() {
     var box = document.getElementById("drawer");
-    var scroller = box.querySelector(".dbody");
-    var keepScroll = scroller ? scroller.scrollTop : 0;
-    var openSteps = {};
-    box.querySelectorAll(".steps li.open").forEach(function (li) { openSteps[li.dataset.i] = true; });
-    var openDetails = {};
-    box.querySelectorAll("details[data-key]").forEach(function (dt) { openDetails[dt.dataset.key] = dt.open; });
     clear(box);
-    var data = drawer.data, a = data && data.agent;
-    var node = drawer.node || {};
-    var title = a ? a.label : (node.label || "Agent");
+    var dom = { sig: {}, items: {} };
+    dom.title = el("h3");
+    dom.status = el("div", { class: "sub" });
     box.appendChild(el("div", { class: "dhead" }, [
-      el("div", { style: "flex:1;min-width:0" }, [
-        el("h3", { text: title }),
-        el("div", { class: "sub" }, [a ? badge(a.state === "running" && a.quiet ? "quiet" : a.state) : badge(drawer.agentId ? "loading" : "not started"),
-          node.line ? "  script line " + node.line : ""]),
-      ]),
+      el("div", { style: "flex:1;min-width:0" }, [dom.title, dom.status]),
       el("button", { text: "Close", on: { click: closeDrawer } }),
     ]));
-    var body = el("div", { class: "dbody" });
-    box.appendChild(body);
+    dom.body = el("div", { class: "dbody" });
+    box.appendChild(dom.body);
+    dom.instances = el("div");
+    dom.top = el("div");
+    dom.result = el("div");
+    dom.prompt = el("div");
+    dom.count = el("span");
+    var toggle = el("input", { type: "checkbox", on: { change: function (e) {
+      drawer.showThinking = e.target.checked; store("ww.thinking", e.target.checked ? "1" : "0"); renderDrawer(); } } });
+    toggle.checked = drawer.showThinking;
+    dom.stepsHead = el("h4", null, [dom.count, "  ", el("label", { class: "sub", style: "text-transform:none;letter-spacing:0;font-weight:400" }, [toggle, " show thinking"])]);
+    dom.list = el("ul", { class: "steps" });
+    dom.meta = el("div");
+    [dom.instances, dom.top, dom.result, dom.prompt, dom.stepsHead, dom.list, dom.meta].forEach(function (n) { dom.body.appendChild(n); });
+    return dom;
+  }
 
-    if (drawer.instances.length > 1) {
-      body.appendChild(el("h4", { text: "Runs of this step (" + drawer.instances.length + ")" }));
-      var inst = el("div", { class: "instances" });
-      drawer.instances.forEach(function (x) {
-        inst.appendChild(el("button", { class: x.agentId === drawer.agentId ? "on" : "", text: x.label + (x.state === "running" ? " ●" : ""),
-          on: { click: function () { selectAgent(x.agentId); } } }));
-      });
-      body.appendChild(inst);
+  function changed(dom, key, value) {
+    var sig = JSON.stringify(value);
+    if (dom.sig[key] === sig) return false;
+    dom.sig[key] = sig;
+    return true;
+  }
+
+  function stepSig(s) { return [s.result !== undefined, !!s.isError, s.summary || "", (s.text || "").length].join("|"); }
+
+  function stepItem(s) {
+    var kind = s.kind === "tool" ? s.name : s.kind === "text" ? "message" : s.kind === "tool_result" ? "result" : s.kind;
+    var li = el("li", { data: { i: String(s.i) } }, [
+      el("div", { class: "srow" }, [
+        el("span", { class: "stime", text: fmtClock(s.time) }),
+        el("span", { class: "skind" + (s.kind === "tool" ? " tool-" + String(s.name || "").toLowerCase().replace(/[^a-z]/g, "") : ""), text: kind }),
+        el("span", { class: "stext" }),
+      ]),
+    ]);
+    var item = { li: li, s: s, sig: null };
+    li.firstChild.addEventListener("click", function () {
+      var open = li.classList.toggle("open");
+      var det = li.querySelector(".sdetail");
+      if (open && !det) li.appendChild(stepDetail(item.s));
+      if (!open && det) li.removeChild(det);
+    });
+    updateStepItem(item, s);
+    return item;
+  }
+
+  function updateStepItem(item, s) {
+    var sig = stepSig(s);
+    if (item.sig === sig) return;
+    var wasPending = item.sig !== null && item.s.result === undefined && s.result !== undefined;
+    item.sig = sig;
+    item.s = s;
+    item.li.className = "k-" + s.kind + (s.isError ? " err" : "") + (item.li.classList.contains("open") ? " open" : "");
+    var text = s.kind === "tool" ? (s.summary || "") : (s.text || "");
+    item.li.querySelector(".stext").textContent = text.split("\n")[0] || (s.kind === "thinking" ? "(hidden by the model)" : "");
+    var det = item.li.querySelector(".sdetail");
+    if (det && wasPending) item.li.replaceChild(stepDetail(s), det);   // its result arrived
+  }
+
+  function renderDrawer() {
+    if (!drawer.dom) drawer.dom = drawerSkeleton();
+    var dom = drawer.dom;
+    var data = drawer.data, a = data && data.agent;
+    var node = drawer.node || {};
+    dom.title.textContent = a ? a.label : (node.label || "Agent");
+    if (changed(dom, "status", [a && a.state, a && a.quiet, drawer.agentId, node.line])) {
+      clear(dom.status);
+      dom.status.appendChild(a ? badge(a.state === "running" && a.quiet ? "quiet" : a.state) : badge(drawer.agentId ? "loading" : "not started"));
+      if (node.line) dom.status.appendChild(document.createTextNode("  script line " + node.line));
     }
-
-    if (!drawer.agentId) {
-      body.appendChild(el("p", { class: "sub", text: "This step has not started in this run." }));
-      if (node.prompt) { body.appendChild(el("h4", { text: "Prompt in the script" })); body.appendChild(el("pre", { class: "box", text: node.prompt })); }
-      return;
-    }
-    if (!data) { body.appendChild(el("p", { class: "sub", text: "Loading…" })); return; }
-
-    var facts = [
-      ["Phase", a.phase || "—"], ["Model", a.model || "—"], ["Started", fmtTime(a.start)],
-      [a.state === "running" ? "Elapsed" : "Duration", since(a.start, a.state === "running" ? null : a.end)],
-      ["Tool calls", a.toolCalls != null ? String(a.toolCalls) : "—"],
-      ["Tokens", a.tokens ? fmtTokens(a.tokens) : (a.contextTokens ? fmtTokens(a.contextTokens) + " context, " + fmtTokens(a.outputTokens) + " out" : "—")],
-      ["Agent id", a.agentId], ["Working dir", data.cwd || "—"],
-    ];
-    if (data.gitBranch) facts.push(["Branch", data.gitBranch]);
-    if (a.attempt && a.attempt > 1) facts.push(["Attempt", String(a.attempt)]);
-    body.appendChild(el("div", { class: "facts" }, facts.map(function (f) {
-      return el("div", { class: "fact" }, [el("div", { class: "k", text: f[0] }), el("div", { class: "v" }, [f[1]])]);
-    })));
-
-    if (a.state === "running") {
-      body.appendChild(el("h4", { text: "Now" }));
-      var now = el("div", { class: "now-box" + (a.quiet ? " quiet" : "") });
-      if (a.lastTool) {
-        now.appendChild(el("div", null, [el("b", { text: a.lastTool.name }), " " + (a.lastTool.summary || "")]));
-        var lastStep = a.lastTool.step != null ? drawer.steps[a.lastTool.step] : null;
-        if (lastStep && lastStep.command) now.appendChild(el("pre", { class: "mono sub", text: lastStep.command }));
-        now.appendChild(el("div", { class: "sub" }, [ago(a.lastTool.time, "called "), lastStep && !lastStep.result ? " · waiting for its result" : ""]));
-      } else now.appendChild(el("div", { text: "Starting…" }));
-      now.appendChild(el("div", { class: "sub" }, [ago(a.lastActivity, "last activity ")]));
-      body.appendChild(now);
-      if (a.lastText) {
-        body.appendChild(el("h4", { text: "Last message" }));
-        body.appendChild(el("div", { class: "box val-str", text: a.lastText.text }));
+    if (changed(dom, "instances", drawer.instances.map(function (x) { return [x.agentId, x.state, x.label]; }).concat([drawer.agentId]))) {
+      clear(dom.instances);
+      if (drawer.instances.length > 1) {
+        dom.instances.appendChild(el("h4", { text: "Runs of this step (" + drawer.instances.length + ")" }));
+        var inst = el("div", { class: "instances" });
+        drawer.instances.forEach(function (x) {
+          inst.appendChild(el("button", { class: x.agentId === drawer.agentId ? "on" : "", text: x.label + (x.state === "running" ? " ●" : ""),
+            on: { click: function () { selectAgent(x.agentId); } } }));
+        });
+        dom.instances.appendChild(inst);
       }
     }
 
-    if (data.hasResult) {
-      body.appendChild(el("h4", { text: a.cached ? "Returned (from cache)" : "Returned" }));
-      body.appendChild(el("div", { class: "box" }, [renderValue(data.result)]));
-    } else if (a.state !== "running" && a.resultPreview) {
-      body.appendChild(el("h4", { text: "Returned (preview)" }));
-      body.appendChild(el("div", { class: "box val-str", text: a.resultPreview }));
+    if (!drawer.agentId || !data) {
+      if (changed(dom, "top", ["empty", drawer.agentId, !!data])) {
+        clear(dom.top);
+        if (!drawer.agentId) {
+          dom.top.appendChild(el("p", { class: "sub", text: "This step has not started in this run." }));
+          if (node.prompt) { dom.top.appendChild(el("h4", { text: "Prompt in the script" })); dom.top.appendChild(el("pre", { class: "box", text: node.prompt })); }
+        } else dom.top.appendChild(el("p", { class: "sub", text: "Loading…" }));
+      }
+      return;
     }
 
-    var prompt = data.prompt;
-    if (prompt) {
-      var pd = el("details", { data: { key: "prompt" } }, [el("summary", { text: "Prompt (" + prompt.length + " characters)" }),
-        el("pre", { class: "box", text: prompt })]);
-      if (openDetails.prompt) pd.open = true;
-      body.appendChild(pd);
+    var lastStep = a.lastTool && a.lastTool.step != null ? drawer.steps[a.lastTool.step] : null;
+    if (changed(dom, "top", [a.state, a.quiet, a.phase, a.model, a.start, a.end, a.toolCalls, a.tokens, a.contextTokens,
+                             a.outputTokens, data.cwd, data.gitBranch, a.attempt, a.lastTool && [a.lastTool.step, a.lastTool.time],
+                             !!(lastStep && lastStep.command), lastStep && lastStep.result !== undefined, a.lastText && a.lastText.time])) {
+      clear(dom.top);
+      var facts = [
+        ["Phase", a.phase || "—"], ["Model", a.model || "—"], ["Started", fmtTime(a.start)],
+        [a.state === "running" ? "Elapsed" : "Duration", since(a.start, a.state === "running" ? null : a.end)],
+        ["Tool calls", a.toolCalls != null ? String(a.toolCalls) : "—"],
+        ["Tokens", a.tokens ? fmtTokens(a.tokens) : (a.contextTokens ? fmtTokens(a.contextTokens) + " context, " + fmtTokens(a.outputTokens) + " out" : "—")],
+        ["Agent id", a.agentId], ["Working dir", data.cwd || "—"],
+      ];
+      if (data.gitBranch) facts.push(["Branch", data.gitBranch]);
+      if (a.attempt && a.attempt > 1) facts.push(["Attempt", String(a.attempt)]);
+      dom.top.appendChild(el("div", { class: "facts" }, facts.map(function (f) {
+        return el("div", { class: "fact" }, [el("div", { class: "k", text: f[0] }), el("div", { class: "v" }, [f[1]])]);
+      })));
+      dom.lastActivity = null;
+      if (a.state === "running") {
+        dom.top.appendChild(el("h4", { text: "Now" }));
+        var now = el("div", { class: "now-box" + (a.quiet ? " quiet" : "") });
+        if (a.lastTool) {
+          now.appendChild(el("div", null, [el("b", { text: a.lastTool.name }), " " + (a.lastTool.summary || "")]));
+          if (lastStep && lastStep.command) now.appendChild(codeBlock(lastStep.command, { lang: "bash", lineNumbers: false, term: true, cmd: true, maxLines: 12 }));
+          now.appendChild(el("div", { class: "sub" }, [ago(a.lastTool.time, "called "), lastStep && lastStep.result === undefined ? " · waiting for its result" : ""]));
+        } else now.appendChild(el("div", { text: "Starting…" }));
+        dom.lastActivity = ago(a.lastActivity, "last activity ");
+        now.appendChild(el("div", { class: "sub" }, [dom.lastActivity]));
+        dom.top.appendChild(now);
+        if (a.lastText) {
+          dom.top.appendChild(el("h4", { text: "Last message" }));
+          dom.top.appendChild(el("div", { class: "box" }, [codeBlockOrProse(a.lastText.text)]));
+        }
+      }
+    } else if (dom.lastActivity && a.lastActivity) {
+      dom.lastActivity.dataset.ago = String(a.lastActivity);   // the clock redraws it
     }
 
-    var stepsHead = el("h4", null, ["Steps (" + data.stepCount + ")  "]);
-    var thinkToggle = el("label", { class: "sub", style: "text-transform:none;letter-spacing:0;font-weight:400" }, [
-      el("input", { type: "checkbox", on: { change: function (e) { drawer.showThinking = e.target.checked; store("ww.thinking", e.target.checked ? "1" : "0"); renderDrawer(); } } }),
-      " show thinking"]);
-    thinkToggle.querySelector("input").checked = drawer.showThinking;
-    stepsHead.appendChild(thinkToggle);
-    body.appendChild(stepsHead);
-    var list = el("ul", { class: "steps" });
+    if (changed(dom, "result", [data.hasResult, a.state, a.cached, a.resultPreview || ""])) {
+      clear(dom.result);
+      if (data.hasResult) {
+        dom.result.appendChild(el("h4", { text: a.cached ? "Returned (from cache)" : "Returned" }));
+        dom.result.appendChild(el("div", { class: "box" }, [renderValue(data.result)]));
+      } else if (a.state !== "running" && a.resultPreview) {
+        dom.result.appendChild(el("h4", { text: "Returned (preview)" }));
+        dom.result.appendChild(el("div", { class: "box val-str", text: a.resultPreview }));
+      }
+    }
+
+    if (data.prompt && changed(dom, "prompt", data.prompt.length)) {
+      clear(dom.prompt);
+      dom.prompt.appendChild(el("details", null, [el("summary", { text: "Prompt (" + data.prompt.length + " characters)" }),
+        el("div", { class: "box" }, [codeBlockOrProse(data.prompt)])]));
+    }
+
+    dom.count.textContent = "Steps (" + data.stepCount + ")";
+    if (changed(dom, "thinking", drawer.showThinking)) { clear(dom.list); dom.items = {}; }
     var shown = drawer.steps.filter(function (s) { return drawer.showThinking || s.kind !== "thinking"; });
-    shown.forEach(function (s) {
-      var kind = s.kind === "tool" ? s.name : s.kind === "text" ? "message" : s.kind === "tool_result" ? "result" : s.kind;
-      var text = s.kind === "tool" ? (s.summary || "") : (s.text || "");
-      var li = el("li", { class: "k-" + s.kind + (s.isError ? " err" : ""), data: { i: String(s.i) } }, [
-        el("div", { class: "srow" }, [
-          el("span", { class: "stime", text: fmtClock(s.time) }),
-          el("span", { class: "skind", text: kind }),
-          el("span", { class: "stext", text: text.split("\n")[0] || (s.kind === "thinking" ? "(hidden by the model)" : "") }),
-        ]),
-      ]);
-      li.firstChild.addEventListener("click", function () {
-        var open = li.classList.toggle("open");
-        var det = li.querySelector(".sdetail");
-        if (open && !det) li.appendChild(stepDetail(s));
-        if (!open && det) li.removeChild(det);
-      });
-      if (openSteps[String(s.i)]) { li.classList.add("open"); li.appendChild(stepDetail(s)); }
-      list.appendChild(li);
-    });
-    if (!shown.length) list.appendChild(el("li", { class: "sub", text: "No steps yet." }));
-    body.appendChild(list);
-    if (data.meta) {
-      var md = el("details", { data: { key: "meta" } }, [el("summary", { text: "Agent facts (meta file)" }), el("div", { class: "box" }, [renderValue(data.meta)])]);
-      if (openDetails.meta) md.open = true;
-      body.appendChild(md);
+    if (!shown.length) {
+      if (!dom.list.firstChild) dom.list.appendChild(el("li", { class: "sub empty-steps", text: "No steps yet." }));
+    } else {
+      var placeholder = dom.list.querySelector(".empty-steps");
+      if (placeholder) dom.list.removeChild(placeholder);
     }
-    body.scrollTop = keepScroll;
+    shown.forEach(function (s) {
+      var item = dom.items[s.i];
+      if (item) updateStepItem(item, s);
+      else { item = stepItem(s); dom.items[s.i] = item; dom.list.appendChild(item.li); }
+    });
+
+    if (data.meta && changed(dom, "meta", true)) {
+      clear(dom.meta);
+      dom.meta.appendChild(el("details", null, [el("summary", { text: "Agent facts (meta file)" }), el("div", { class: "box" }, [renderValue(data.meta)])]));
+    }
   }
 
-  function stepDetail(s) {
+  // --------------------------------------------------------- tool views
+  /* Each tool call is shown in a form that fits it: a terminal for Bash, a
+     diff for Edit, a code file for Read and Write, a form for the rest.
+     Never raw JSON. All text goes in through textContent. */
+
+  var H = window.WWHighlight;
+  var PREVIEW_LINES = 300;
+
+  function stripAnsi(text) { return String(text || "").replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g, ""); }
+
+  function tokenSpans(parent, toks) {
+    toks.forEach(function (t) {
+      parent.appendChild(t.c ? el("span", { class: "tk-" + t.c, text: t.t }) : document.createTextNode(t.t));
+    });
+    if (!toks.length) parent.appendChild(document.createTextNode("​"));
+  }
+
+  /* A code block with optional line numbers. opts: lang, numbers (array),
+     start, lineNumbers (false hides), term, cmd, maxLines. */
+  function codeBlock(text, opts) {
+    opts = opts || {};
+    text = String(text == null ? "" : text);
+    var lines = H.lines(text, opts.lang || null);
+    if (lines.length > 1 && !lines[lines.length - 1].length && /\n$/.test(text)) lines.pop();
+    var wrap = el("div", { class: "code" + (opts.term ? " term" : "") + (opts.cmd ? " cmd" : "") });
+    var body = el("div", { class: "code-body" });
+    wrap.appendChild(body);
+    var start = opts.start || 1;
+    function row(i) {
+      var r = el("div", { class: "cl" + (opts.rowClass ? " " + opts.rowClass(i) : "") });
+      if (opts.lineNumbers !== false) {
+        var n = opts.numbers ? opts.numbers[i] : start + i;
+        r.appendChild(el("span", { class: "ln", text: n == null ? "" : String(n) }));
+      }
+      var c = el("span", { class: "lc" });
+      tokenSpans(c, lines[i]);
+      r.appendChild(c);
+      return r;
+    }
+    var limit = Math.min(lines.length, opts.maxLines || PREVIEW_LINES);
+    for (var i = 0; i < limit; i++) body.appendChild(row(i));
+    if (limit < lines.length) {
+      var more = el("button", { class: "more", text: "Show all " + lines.length + " lines" });
+      more.addEventListener("click", function () {
+        for (var j = limit; j < lines.length; j++) body.appendChild(row(j));
+        wrap.removeChild(more);
+      });
+      wrap.appendChild(more);
+    }
+    return wrap;
+  }
+
+  function chip(text, cls) { return el("span", { class: "tchip" + (cls ? " " + cls : ""), text: text }); }
+
+  function fileHeader(path, chips) {
+    path = String(path || "");
+    var cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+    var head = el("div", { class: "fhead", title: path }, [
+      el("span", { class: "fdir", text: cut >= 0 ? path.slice(0, cut + 1) : "" }),
+      el("span", { class: "fname", text: cut >= 0 ? path.slice(cut + 1) : path }),
+    ]);
+    var box = el("div", { class: "fchips" });
+    (chips || []).forEach(function (c) { if (c) box.appendChild(c); });
+    head.appendChild(box);
+    return head;
+  }
+
+  function label(text) { return el("div", { class: "tlabel", text: text }); }
+
+  function proseBlock(text) { return el("div", { class: "prose", text: String(text || "") }); }
+
+  /* Split "Exit code 2\n..." and the reminders Claude Code appends. */
+  function splitResult(text) {
+    text = stripAnsi(text);
+    var exit = null, notes = [];
+    var m = /^Exit code (\d+)\n?/.exec(text);
+    if (m) { exit = Number(m[1]); text = text.slice(m[0].length); }
+    text = text.replace(/\n*<system-reminder>[\s\S]*?<\/system-reminder>\n*/g, function (r) {
+      notes.push(r.replace(/<\/?system-reminder>/g, "").trim()); return "\n";
+    }).replace(/\s+$/, "");
+    return { text: text, exit: exit, notes: notes };
+  }
+
+  function resultNotes(parts, notes) {
+    if (!notes.length) return;
+    parts.push(el("details", { class: "rnotes" }, [el("summary", { text: "Notes Claude Code added to the result (" + notes.length + ")" }),
+      el("div", { class: "prose sub", text: notes.join("\n\n") })]));
+  }
+
+  function lineStats(rows) {
+    var add = 0, del = 0;
+    rows.forEach(function (r) { if (r.k === "+") add++; else if (r.k === "-") del++; });
+    return el("span", { class: "dstat" }, [el("span", { class: "dadd", text: "+" + add }), " ", el("span", { class: "ddel", text: "−" + del })]);
+  }
+
+  /* A diff of two texts with three lines of context around each change. */
+  function diffBlock(oldText, newText, lang) {
+    var rows = H.diffLines(oldText, newText);
+    var a = H.lines(oldText, lang), b = H.lines(newText, lang);
+    var keep = rows.map(function () { return false; });
+    rows.forEach(function (r, i) {
+      if (r.k !== " ") for (var j = Math.max(0, i - 3); j <= Math.min(rows.length - 1, i + 3); j++) keep[j] = true;
+    });
+    var wrap = el("div", { class: "code diff" });
+    var body = el("div", { class: "code-body" });
+    wrap.appendChild(body);
+    var skipped = 0;
+    function flushSkip() {
+      if (skipped) body.appendChild(el("div", { class: "cl dskip" }, [el("span", { class: "ln", text: "" }), el("span", { class: "lc", text: "⋯ " + skipped + " unchanged line" + (skipped > 1 ? "s" : "") })]));
+      skipped = 0;
+    }
+    rows.forEach(function (r, i) {
+      if (!keep[i]) { skipped++; return; }
+      flushSkip();
+      var toks = r.k === "+" ? b[r.b] : a[r.a];
+      var line = el("div", { class: "cl" + (r.k === "+" ? " dadd-row" : r.k === "-" ? " ddel-row" : "") }, [
+        el("span", { class: "ln dsign", text: r.k === " " ? "" : r.k === "-" ? "−" : "+" }),
+      ]);
+      var c = el("span", { class: "lc" });
+      tokenSpans(c, toks || []);
+      line.appendChild(c);
+      body.appendChild(line);
+    });
+    flushSkip();
+    return { el: wrap, stats: lineStats(rows) };
+  }
+
+  function errorBox(text) { return el("div", { class: "terr" }, [codeBlock(stripAnsi(text), { lang: "log", lineNumbers: false })]); }
+
+  function pending(parts) { parts.push(el("div", { class: "tpending", text: "Waiting for the result…" })); }
+
+  function viewBash(inp, d) {
     var parts = [];
-    if (s.kind === "tool") {
-      if (s.command) parts.push(el("pre", { class: "mono", text: "$ " + s.command }));
-      else if (s.input) parts.push(el("pre", { class: "mono", text: s.input }));
-      parts.push(el("div", { class: "sub", text: s.result !== undefined ? (s.isError ? "Error" : "Result") + (s.end ? " at " + fmtClock(s.end) : "") : "No result yet." }));
-      if (s.result !== undefined) parts.push(el("pre", { class: "mono", text: s.result || "(empty)" }));
-    } else parts.push(el("div", { class: "val-str", text: s.text || "" }));
-    return el("div", { class: "sdetail" }, parts);
+    var chips = [];
+    if (inp.run_in_background) chips.push(chip("in background"));
+    if (inp.timeout) chips.push(chip("timeout " + fmtDur(Number(inp.timeout))));
+    if (inp.description) parts.push(el("div", { class: "tdesc" }, [el("span", { text: inp.description })].concat(chips)));
+    else if (chips.length) parts.push(el("div", { class: "tdesc" }, chips));
+    var term = el("div", { class: "terminal" });
+    term.appendChild(codeBlock(inp.command || "", { lang: "bash", lineNumbers: false, term: true, cmd: true }));
+    if (d.result === undefined) term.appendChild(el("div", { class: "tpending term-pending", text: "running…" }));
+    else {
+      var r = splitResult(d.result);
+      if (r.exit !== null || d.isError) term.appendChild(el("div", { class: "texit" + (r.exit === 0 ? "" : " bad"), text: r.exit !== null ? "exit code " + r.exit : "error" }));
+      if (r.text) term.appendChild(codeBlock(r.text, { lang: "log", lineNumbers: false, term: true, maxLines: 400 }));
+      else term.appendChild(el("div", { class: "tpending term-pending", text: "(no output)" }));
+      parts.push(term);
+      resultNotes(parts, r.notes);
+      return parts;
+    }
+    parts.push(term);
+    return parts;
+  }
+
+  function viewRead(inp, d) {
+    var chips = [];
+    if (inp.offset || inp.limit) chips.push(chip("lines " + (inp.offset || 1) + (inp.limit ? "–" + ((inp.offset || 1) + inp.limit - 1) : "+")));
+    if (inp.pages) chips.push(chip("pages " + inp.pages));
+    var parts = [fileHeader(inp.file_path || inp.notebook_path || inp.path, chips)];
+    if (d.result === undefined) { pending(parts); return parts; }
+    if (d.isError) { parts.push(errorBox(d.result)); return parts; }
+    var r = splitResult(d.result);
+    var nums = [], code = [], tail = [], numbered = 0;
+    r.text.split("\n").forEach(function (line) {
+      var m = /^\s*(\d+)(?:(?:\t|→)(.*))?$/.exec(line);
+      if (m && (m[2] !== undefined || numbered) && !tail.length) { nums.push(Number(m[1])); code.push(m[2] || ""); numbered++; }
+      else if (numbered) tail.push(line);
+      else { nums.push(null); code.push(line); }
+    });
+    var lang = H.langFor(inp.file_path) || H.sniff(code.join("\n"));
+    if (numbered) parts.push(codeBlock(code.join("\n"), { lang: lang, numbers: nums }));
+    else parts.push(codeBlock(r.text, { lang: lang || "log", lineNumbers: false }));
+    if (tail.join("").trim()) parts.push(el("div", { class: "prose sub", text: tail.join("\n").trim() }));
+    resultNotes(parts, r.notes);
+    return parts;
+  }
+
+  function viewWrite(inp, d) {
+    var content = String(inp.content || "");
+    var count = content ? content.split("\n").length - (/\n$/.test(content) ? 1 : 0) : 0;
+    var parts = [fileHeader(inp.file_path, [chip(count + " lines"), d.result !== undefined && !d.isError ? chip(/created/i.test(d.result) ? "new file" : "written", "ok") : null])];
+    parts.push(codeBlock(content, { lang: H.langFor(inp.file_path) || H.sniff(content) }));
+    if (d.result === undefined) pending(parts);
+    else if (d.isError) parts.push(errorBox(d.result));
+    return parts;
+  }
+
+  function viewEdit(inp, d) {
+    var lang = H.langFor(inp.file_path);
+    var edits = Array.isArray(inp.edits) ? inp.edits : [inp];
+    var parts = [], chips = [];
+    if (inp.replace_all) chips.push(chip("replace all"));
+    var diffs = edits.map(function (e) { return diffBlock(e.old_string || "", e.new_string || "", lang); });
+    if (diffs.length === 1) chips.push(diffs[0].stats);
+    else chips.push(chip(diffs.length + " edits"));
+    if (d.result !== undefined) chips.push(d.isError ? chip("failed", "bad") : chip("applied", "ok"));
+    parts.push(fileHeader(inp.file_path, chips));
+    diffs.forEach(function (df, i) {
+      if (diffs.length > 1) parts.push(el("div", { class: "tlabel" }, ["Edit " + (i + 1) + "  ", df.stats, edits[i].replace_all ? "  · replace all" : ""]));
+      parts.push(df.el);
+    });
+    if (d.result === undefined) pending(parts);
+    else if (d.isError) parts.push(errorBox(d.result));
+    return parts;
+  }
+
+  function viewSearch(inp, d, name) {
+    var parts = [];
+    var form = el("div", { class: "tform" });
+    var pattern = inp.pattern || inp.query || "";
+    form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: name === "Glob" ? "files" : "pattern" }), el("code", { class: "tpat", text: pattern })]));
+    var chips = [];
+    ["path", "glob", "type", "output_mode", "-i", "-n", "multiline", "head_limit", "-A", "-B", "-C"].forEach(function (k) {
+      if (inp[k] !== undefined && inp[k] !== false && k !== "path") chips.push(chip(k.replace(/^-/, "") + (inp[k] === true ? "" : " " + inp[k])));
+    });
+    if (inp.path) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "in" }), el("span", { class: "mono", text: inp.path })]));
+    if (chips.length) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "options" })].concat(chips)));
+    parts.push(form);
+    if (d.result === undefined) { pending(parts); return parts; }
+    if (d.isError) { parts.push(errorBox(d.result)); return parts; }
+    var r = splitResult(d.result);
+    parts.push(label("Found"));
+    parts.push(codeBlock(r.text || "(nothing)", { lang: "grep", lineNumbers: false, maxLines: 200 }));
+    resultNotes(parts, r.notes);
+    return parts;
+  }
+
+  function viewWeb(inp, d, name) {
+    var parts = [];
+    var form = el("div", { class: "tform" });
+    if (inp.url) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "url" }), el("span", { class: "mono", text: inp.url })]));
+    if (inp.query) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "query" }), el("span", { text: inp.query })]));
+    if (inp.mode) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "mode" }), chip(inp.mode)]));
+    parts.push(form);
+    if (inp.prompt) { parts.push(label("Asked")); parts.push(proseBlock(inp.prompt)); }
+    if (d.result === undefined) { pending(parts); return parts; }
+    if (d.isError) { parts.push(errorBox(d.result)); return parts; }
+    var r = splitResult(d.result);
+    parts.push(label(name === "WebSearch" ? "Results" : "Answer"));
+    parts.push(codeBlock(r.text, { lang: "markdown", lineNumbers: false, maxLines: 200, rowClass: function () { return "wrapline"; } }));
+    resultNotes(parts, r.notes);
+    return parts;
+  }
+
+  function viewTodos(inp) {
+    var list = el("ul", { class: "todos" });
+    (inp.todos || []).forEach(function (t) {
+      var st = t.status || "pending";
+      list.appendChild(el("li", { class: "todo-" + st }, [el("span", { class: "tbox", text: st === "completed" ? "☑" : st === "in_progress" ? "◐" : "☐" }),
+        el("span", { text: t.content || t.activeForm || "" })]));
+    });
+    return [list];
+  }
+
+  function viewAgent(inp, d) {
+    var parts = [];
+    var form = el("div", { class: "tform" });
+    if (inp.description) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "task" }), el("b", { text: inp.description })]));
+    if (inp.subagent_type) form.appendChild(el("div", { class: "trow" }, [el("span", { class: "tk", text: "type" }), chip(inp.subagent_type)]));
+    parts.push(form);
+    if (inp.prompt) { parts.push(label("Prompt")); parts.push(codeBlock(inp.prompt, { lang: "markdown", lineNumbers: false, maxLines: 120, rowClass: function () { return "wrapline"; } })); }
+    genericResult(parts, d);
+    return parts;
+  }
+
+  function viewStructured(inp, d) {
+    if (typeof inp.__unparsedToolInput === "string") {
+      var raw = inp.__unparsedToolInput, value = null;
+      try { value = JSON.parse(raw); } catch (e) { value = null; }
+      var p = [label("The agent tried to return this, but it could not be read as the asked shape")];
+      p.push(value !== null && typeof value === "object" ? el("div", { class: "box" }, [renderValue(value)]) : codeBlock(raw, { lang: "json", lineNumbers: false, rowClass: function () { return "wrapline"; } }));
+      if (d.result !== undefined) { p.push(label(d.isError ? "Why it was refused" : "Result")); p.push(d.isError ? errorBox(d.result) : proseBlock(d.result)); }
+      return p;
+    }
+    var parts = [label("The value the agent returned"), el("div", { class: "box" }, [renderValue(inp)])];
+    if (d.isError) parts.push(errorBox(d.result));
+    return parts;
+  }
+
+  function looksLikeCode(text) { return /\n/.test(text) && /[{}();=<>]|^\s{2,}\S/m.test(text); }
+
+  function genericForm(inp) {
+    var form = el("div", { class: "tform" });
+    if (!inp || typeof inp !== "object") { form.appendChild(proseBlock(String(inp == null ? "" : inp))); return form; }
+    Object.keys(inp).forEach(function (k) {
+      var v = inp[k];
+      if (v === undefined || k === "__unparsedToolInput") return;
+      var value;
+      if (typeof v === "string") {
+        if (v.length < 140 && v.indexOf("\n") < 0) value = el("span", { class: /path|file|url|command|pattern/.test(k) ? "mono" : "", text: v });
+        else value = looksLikeCode(v) ? codeBlock(v, { lang: H.sniff(v), lineNumbers: false, maxLines: 150 }) : proseBlock(v);
+      } else if (typeof v === "number" || typeof v === "boolean" || v === null) value = chip(String(v));
+      else value = el("div", { class: "box" }, [renderValue(v)]);
+      form.appendChild(el("div", { class: "trow" + (typeof v === "string" && v.length >= 140 || (v && typeof v === "object") ? " tcol" : "") },
+        [el("span", { class: "tk", text: k }), value]));
+    });
+    return form;
+  }
+
+  function genericResult(parts, d) {
+    if (d.result === undefined) { pending(parts); return; }
+    if (d.isError) { parts.push(label("Error")); parts.push(errorBox(d.result)); return; }
+    var r = splitResult(d.result);
+    if (!r.text) { parts.push(el("div", { class: "sub", text: "(empty result)" })); return; }
+    parts.push(label("Result"));
+    var parsed = null;
+    if (/^[\[{]/.test(r.text)) { try { parsed = JSON.parse(r.text); } catch (e) { parsed = null; } }
+    if (parsed !== null && typeof parsed === "object") parts.push(el("div", { class: "box" }, [renderValue(parsed)]));
+    else parts.push(codeBlock(r.text, { lang: H.sniff(r.text) || "log", lineNumbers: false, maxLines: 200, rowClass: function () { return "wrapline"; } }));
+    resultNotes(parts, r.notes);
+  }
+
+  function viewGeneric(inp, d) {
+    var parts = [genericForm(inp)];
+    genericResult(parts, d);
+    return parts;
+  }
+
+  function viewTool(d) {
+    var inp = d.input && typeof d.input === "object" ? d.input : {};
+    var name = d.name || "";
+    var parts;
+    try {
+      if (name === "Bash" || name === "Monitor" || name === "BashOutput") parts = inp.command !== undefined ? viewBash(inp, d) : viewGeneric(inp, d);
+      else if (name === "Read" || name === "NotebookRead") parts = viewRead(inp, d);
+      else if (name === "Write") parts = viewWrite(inp, d);
+      else if (name === "Edit" || name === "MultiEdit") parts = viewEdit(inp, d);
+      else if (name === "Grep" || name === "Glob" || name === "LS") parts = viewSearch(inp, d, name);
+      else if (name === "WebFetch" || name === "WebSearch") parts = viewWeb(inp, d, name);
+      else if (name === "TodoWrite") parts = viewTodos(inp);
+      else if (name === "Agent" || name === "Task") parts = viewAgent(inp, d);
+      else if (name === "StructuredOutput") parts = viewStructured(inp, d);
+      else parts = viewGeneric(inp, d);
+    } catch (e) {
+      parts = [el("p", { class: "note", text: "This call could not be shown in its own form (" + e.message + ")." }), genericForm(inp)];
+      genericResult(parts, d);
+    }
+    if (d.time) {
+      var timing = "called " + fmtClock(d.time);
+      if (d.end) timing += " · took " + fmtDur(d.end - d.time);
+      parts.push(el("div", { class: "ttime", text: timing }));
+    }
+    (d.notes || []).forEach(function (n) { parts.push(el("p", { class: "note", text: n })); });
+    return parts;
+  }
+
+  /* The open body of one step: fetched in full from the server. */
+  var stepCache = {};
+  function stepDetail(s) {
+    var box = el("div", { class: "sdetail" });
+    var key = drawer.run + "|" + drawer.agentId + "|" + s.i;
+    var cached = stepCache[key];
+    var fresh = cached && (cached.kind !== "tool" || cached.result !== undefined || s.result === undefined);
+    function fill(d) {
+      clear(box);
+      var parts;
+      if (d.kind === "tool") parts = viewTool(d);
+      else if (d.kind === "text" || d.kind === "thinking" || d.kind === "user" || d.kind === "system")
+        parts = [el("div", { class: "prose" + (d.kind === "thinking" ? " sub" : "") }, [codeBlockOrProse(d.text)])];
+      else parts = [codeBlock(String(d.text || ""), { lang: "log", lineNumbers: false })];
+      parts.forEach(function (p) { box.appendChild(p); });
+    }
+    if (fresh) { fill(cached); return box; }
+    box.appendChild(el("div", { class: "tpending", text: "Loading…" }));
+    var runId = drawer.run, agentId = drawer.agentId;
+    getJSON("/api/step?run=" + encodeURIComponent(runId) + "&agent=" + encodeURIComponent(agentId) + "&i=" + s.i)
+      .then(function (d) { stepCache[key] = d; fill(d); })
+      .catch(function (e) {
+        clear(box);
+        // fall back to what the step list holds
+        fill({ kind: s.kind, name: s.name, text: s.text, input: null, result: s.result, isError: s.isError,
+               notes: ["The full step could not be loaded (" + e.message + ")."] });
+      });
+    return box;
+  }
+
+  /* An assistant message: prose, with fenced code blocks shown as code. */
+  function codeBlockOrProse(text) {
+    text = String(text || "");
+    var wrap = el("div");
+    var re = /```([\w+-]*)\n([\s\S]*?)(?:```|$)/g, pos = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > pos) wrap.appendChild(el("div", { class: "prose", text: text.slice(pos, m.index).replace(/\n+$/, "") }));
+      var lang = m[1] ? (H.langFor("x." + m[1]) || (H.languages.indexOf(m[1]) >= 0 ? m[1] : null)) : H.sniff(m[2]);
+      wrap.appendChild(codeBlock(m[2].replace(/\n$/, ""), { lang: lang, lineNumbers: false }));
+      pos = re.lastIndex;
+    }
+    if (pos < text.length) wrap.appendChild(el("div", { class: "prose", text: text.slice(pos) }));
+    return wrap;
   }
 
   // first route

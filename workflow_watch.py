@@ -134,6 +134,9 @@ def block_text(content):
 
 def tool_summary(name, tool_input):
     """A short, human description of one tool call."""
+    if name == "StructuredOutput" and isinstance(tool_input, dict):
+        keys = [k for k in tool_input if not k.startswith("__")]
+        return ("returned: " + ", ".join(keys[:8]) + (" …" if len(keys) > 8 else "")) if keys else "returned a value"
     if not isinstance(tool_input, dict):
         return preview(tool_input, 160) or ""
     for key in ("description",):
@@ -4137,8 +4140,19 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
       if (!d) return;
       var shown = shownGraph();
       if (st.runtimeChanged || shown.signature !== st.signature) { drawGraph(); return; }
+      // the drawn boxes keep their place; their agents come from this poll's
+      // expansion (a column node holds the agents bound to it at that time)
+      var fresh = {};
+      (function collect(n) {
+        if (!n) return;
+        if (n.id) fresh[n.id] = n;
+        (n.items || []).forEach(collect);
+        (n.branches || []).forEach(function (b) { collect(b.seq); });
+        if (n.body) collect(n.body);
+      })(shown.graph.seq);
       Object.keys(st.nodeEls).forEach(function (id) {
-        var info = st.nodeEls[id], n = info.node, box = info.el;
+        var info = st.nodeEls[id], n = fresh[id] || info.node, box = info.el;
+        info.node = n;
         if (info.kind === "agent") {
           var inst = G.instancesFor(n, st.match);
           var state = nodeState(inst);
@@ -4347,7 +4361,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
         loadPrompts();
         if (lastStatus !== null && lastStatus !== data.run.status) loadStatic();
         lastStatus = data.run.status;
-        refreshDrawer(runId, st.match);
+        refreshDrawer(runId, st.match, st.nodeEls);
       }).catch(function (e) {
         if (e.status === 404) {
           clear(headBox);
@@ -4398,8 +4412,9 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
 
   /* After each run poll: keep the open node's list of agents fresh, and
      show the first agent of a node that just started. */
-  function refreshDrawer(runId, match) {
+  function refreshDrawer(runId, match, nodeEls) {
     if (drawer.run !== runId || !match || !drawer.node || !drawer.node.id) return;
+    if (nodeEls && nodeEls[drawer.node.id]) drawer.node = nodeEls[drawer.node.id].node;   // this poll's agents
     var inst = G.instancesFor(drawer.node, match);
     if (inst.length === drawer.instances.length) { drawer.instances = inst.slice(); return; }
     drawer.instances = inst.slice();

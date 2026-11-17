@@ -59,14 +59,23 @@ Windows. On Windows, start it with `py workflow_watch.py`.
 - **Flow**: drawn from the script itself, before any agent starts. It shows
   `agent()` calls, `phase()` markers, loops, `if` branches with their
   conditions, `break`/`return`, `parallel()`, `pipeline()` and `.map()`
-  fan-outs, helper functions and child `workflow()` calls. Each started item
-  of a fan-out gets its own column, up to 24 items. The stages of a pipeline
-  are paired by the item value in their labels. Run agents are matched to the
-  nodes by their label templates (`review:${stage}:r${r}`) and phases. An
-  agent that matches no node is listed under the flow.
+  fan-outs, helper functions and child `workflow()` calls. It knows nothing
+  of any one workflow: it reads the script's own structure.
+  - Each started item of a fan-out gets its own column, up to 24 items; a
+    fan-out inside a column opens into columns of its own. The columns follow
+    the item each label names (`review:${file}` and `check:${file}:${kind}` share
+    the column of their file), and the same item in several rounds of a loop
+    stays one column.
+  - A loop shows its round: from the loop counter when a label carries it,
+    else from an agent that runs once per round, else how many agents started.
+  - Run agents are placed by their label templates and phases; an agent whose
+    label says nothing is placed by the literal text of its prompt; a result
+    replayed from cache gets its label from the earlier run of the session.
+    An agent that cannot be placed is listed under the flow.
 - **Agent panel** (click a node or a row): what the agent does now (its last
   tool call and command, how long ago), its last message, what it returned
-  (shown as readable nested lists), its prompt, and all its steps in order.
+  (each field name as a small heading with its value below it; Markdown text
+  shown as Markdown), its prompt, and all its steps in order.
   Thinking blocks are hidden unless you turn them on. The panel updates in
   place, so what you read does not move when new steps arrive.
 - **A step, opened**: each tool in its own form, with syntax colours, never as
@@ -78,7 +87,11 @@ Windows. On Windows, start it with `py workflow_watch.py`.
   The full call is read from the transcript when you open the step.
 
 A Workflow call that waits for your approval is listed as "awaiting launch",
-and its flow is drawn from the script before the run starts.
+and its flow is drawn from the script before the run starts. A workflow
+started by name reads its script from `.claude/workflows/` of the project
+folder or one of its parents, the personal `workflows/` folder next to
+`projects/`, or a plugin's `workflows/` folder. A bundled workflow such as
+`/deep-research` has no script file; its flow is drawn from its agents.
 
 ## How it gets the data
 
@@ -104,7 +117,7 @@ and `<session>` is a session id.
 | `<slug>/<session>.jsonl` | `assistant` entries with a `tool_use` named `Workflow` (its `input.script`, `scriptPath`, `args`). `user` entries whose `toolUseResult` has `runId`, `taskId`, `workflowName`, `summary`. `<task-notification>` texts (`task-id`, `status`, `summary`) in `queue-operation` entries. `cwd` |
 | `<slug>/<session>/workflows/<runId>.json` | the run record, **written only when the run ends**: `status`, `startTime`, `durationMs`, `script`, `args`, `result`, `logs`, `phases`, `workflowProgress`, `totalTokens`, `totalToolCalls` |
 | `<slug>/<session>/subagents/workflows/<runId>/journal.jsonl` | `{"type":"started","agentId","label","phase","key"}` and `{"type":"result","agentId","result"}` lines, appended live, without timestamps |
-| `.../<runId>/agent-<agentId>.jsonl` | the agent transcript, appended live: `timestamp`, `cwd`, `gitBranch`, `message.content` blocks (`text`, `thinking`, `tool_use`, `tool_result`), `message.usage` |
+| `.../<runId>/agent-<agentId>.jsonl` | the agent transcript, appended live: `timestamp`, `cwd`, `gitBranch`, `message.content` blocks (`text`, `thinking`, `tool_use`, `tool_result`), `message.usage`. The first user entry that holds "computed task" is the prompt: a paragraph ending in "follows:" and then the task, every line indented |
 | `.../<runId>/agent-<agentId>.meta.json` | `description` (the label), `workflowPhase`, `model` |
 
 Facts the status depends on:
@@ -121,8 +134,11 @@ Facts the status depends on:
 - Token numbers of finished runs come from the record. For running runs they
   are estimates from the transcripts (marked `~`).
 
-Not verified yet: how an agent that is retried after a stall, or a child
-`workflow()` run, shows up in these files; and the layout on Windows and Linux.
+Not verified with real runs yet (only with the simulator): the label Claude
+Code gives an agent that has no `label`; whether a resumed run writes a
+result line without a start line for a cached agent; how an agent that is
+retried after a stall, or a child `workflow()` run, shows up in these files;
+and the layout on Windows and Linux.
 
 ## When a Claude Code update breaks it
 
@@ -144,5 +160,18 @@ Not verified yet: how an agent that is retried after a stall, or a child
 - `tests/test_graph.py` with `tests/graph_cases.js` and
   `tests/highlight_cases.js`: the flow builder on several script shapes, and
   the syntax highlighter and line diff (need Node.js).
+- `tests/test_scenarios.py`: eleven invented workflow shapes (fan-out with
+  verification, pipeline, loop until dry with nested votes, judge panel,
+  no labels, helpers with switch/try/do-while, 60-item fan-out, fan-out in a
+  fan-out, fan-out in a loop, rounds from a helper-built label) and run
+  states (failed agents, cached results of a resumed run, a cut-off run, a
+  saved workflow started by name, a run watched while it runs, several
+  projects). Each runs in `tools/simulate_workflow.js`, and
+  `tests/scenario_check.js` checks with the page's own code that every agent
+  is drawn once, at the `agent()` call that started it (needs Node.js).
+- `tools/simulate_workflow.js`: runs any workflow script against a fake
+  runtime and writes the files Claude Code writes, live; for example
+  `node tools/simulate_workflow.js --root /tmp/ww-demo --script my-flow.js --step-ms 800`
+  and then `python3 workflow_watch.py --root /tmp/ww-demo`.
 - `tools/simulate_run.py`: an invented live run, for trying the page.
 - `tools/vendor_acorn.py`: replaces the embedded acorn parser.

@@ -29,6 +29,8 @@
                             writes nothing; the others run and are appended; a new record
                             replaces the old one at the end
      --workflows-dir DIR    where workflow('name') finds a child script (<name>.js or its meta name)
+     --image-every N        every Nth agent first reads an image file (a PNG made here),
+                            as an agent does when it looks at a screenshot
      --launch-by-name NAME  the session launches the workflow by name, not by script
      --truth FILE           write the agent -> script line truth here
      --unlabeled-label T    label for agent() calls without one: "prompt" (default: the first
@@ -58,6 +60,7 @@ function parseArgs(argv) {
     else if (k === "--fail") o.fail = new RegExp(take());
     else if (k === "--resume") o.resume = take();
     else if (k === "--workflows-dir") o.workflowsDir = take();
+    else if (k === "--image-every") o.imageEvery = Number(take());
     else if (k === "--launch-by-name") o.byName = take();
     else if (k === "--truth") o.truth = take();
     else if (k === "--unlabeled-label") o.unlabeled = take();
@@ -112,6 +115,29 @@ const launchInput = opts.byName ? { name: opts.byName } : { script: source };
 if (opts.args !== undefined) launchInput.args = opts.args;
 append(sessionFile, { type: "assistant", timestamp: iso(), cwd, sessionId: opts.session,
   message: { role: "assistant", content: [{ type: "tool_use", id: toolUseId, name: "Workflow", input: launchInput }] } });
+
+// ------------------------------------------------------------ a PNG
+const zlib = require("zlib");
+const CRC = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t.push(c >>> 0); } return t; })();
+function crc32(buf) { let c = 0xffffffff; for (const b of buf) c = CRC[(c ^ b) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+/* A small picture of a "page": a coloured bar over light rows. */
+function makePng(seed) {
+  const w = 320, h = 200, raw = Buffer.alloc((w * 3 + 1) * h);
+  const hue = [[47, 111, 222], [23, 152, 74], [201, 58, 58], [183, 121, 31]][seed % 4];
+  for (let y = 0; y < h; y++) {
+    raw[y * (w * 3 + 1)] = 0;
+    for (let x = 0; x < w; x++) {
+      const o = y * (w * 3 + 1) + 1 + x * 3;
+      let c = [246, 247, 249];
+      if (y < 36) c = hue;
+      else if ((y - 50) % 26 < 12 && x > 24 && x < 24 + ((x * 7 + y * 13 + seed * 31) % 3 === 0 ? 260 : 200)) c = [210, 214, 220];
+      raw[o] = c[0]; raw[o + 1] = c[1]; raw[o + 2] = c[2];
+    }
+  }
+  const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length); const body = Buffer.concat([Buffer.from(type), data]); const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(body)); return Buffer.concat([len, body, crc]); };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
+}
 
 // --------------------------------------------------------- fake results
 let boolCounter = 0;
@@ -197,6 +223,15 @@ async function agent(prompt, o) {
   const file = path.join(runDir, "agent-" + agentId + ".jsonl");
   append(file, { type: "user", timestamp: iso(), cwd, agentId, sessionId: opts.session,
     message: { role: "user", content: FRAME + String(prompt).split("\n").map((l) => "  " + l).join("\n") } });
+  if (opts.imageEvery && n % opts.imageEvery === 0) {
+    // the agent looks at a screenshot: Claude Code keeps the image in the transcript
+    const tid = "toolu_" + agentId + "_img";
+    append(file, { type: "assistant", timestamp: iso(), agentId, message: { id: "msg_" + agentId + "_img", role: "assistant", model: "claude-sim-1",
+      content: [{ type: "tool_use", id: tid, name: "Read", input: { file_path: "/sim/screens/" + (label || "page").replace(/[^\w.-]+/g, "_") + ".png" } }] } });
+    await sleep(opts.stepMs / 2);
+    append(file, { type: "user", timestamp: iso(), agentId, toolUseResult: { type: "image" }, message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: tid, content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: makePng(n).toString("base64") } }] }] } });
+  }
   const steps = 2 + (n % 4);
   for (let s = 0; s < steps; s++) {
     const [tool, input] = TOOLS[(n + s) % TOOLS.length];

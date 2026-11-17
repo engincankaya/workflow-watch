@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import workflow_watch as ww  # noqa: E402
-from fixtures import (ProjectBuilder, append_jsonl, now_ms, result, set_mtime,  # noqa: E402
-                      started, transcript)
+from fixtures import (ProjectBuilder, append_jsonl, image_read_transcript, make_png,  # noqa: E402
+                      now_ms, result, set_mtime, started, transcript)
 
 HOUR = 3_600_000
 SCRIPT = """export const meta = { name: 'demo-flow', description: 'Two steps', phases: [{ title: 'Build' }] }
@@ -331,6 +331,58 @@ class ShapesAndDamage(StoreCase):
         agents = self.detail(store, "wf_rep-012")["agents"]
         self.assertIn("other", [a["label"] for a in agents])
         del start
+
+
+class Images(StoreCase):
+    def test_an_image_an_agent_read_is_served_from_its_transcript(self):
+        start = now_ms() - 60_000
+        png = make_png()
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+        self.p.session("s1", [])
+        self.p.journal("s1", "wf_img-014", [{"type": "launched"}, started("a1", "look", "Look")])
+        self.p.agent("s1", "wf_img-014", "a1", "look", "Look",
+                     image_read_transcript(start, [("/shots/home.png", "image/png", png),
+                                                   ("/shots/logo.svg", "image/svg+xml", svg)]))
+        store = ww.Store(self.root)
+        store.refresh(force=True)
+        store.run_detail("wf_img-014")
+        steps = store.agent_detail("wf_img-014", "a1")["steps"]
+        reads = [s for s in steps if s["kind"] == "tool"]
+        self.assertEqual(len(reads), 2)
+        first = store.step_detail("wf_img-014", "a1", reads[0]["i"])
+        self.assertEqual(first["images"], [{"n": 0, "mediaType": "image/png", "shown": True, "bytes": first["images"][0]["bytes"]}])
+        self.assertEqual(first["notes"], [])
+        self.assertEqual(store.step_image("wf_img-014", "a1", reads[0]["i"], 0), (png, "image/png"))
+        second = store.step_detail("wf_img-014", "a1", reads[1]["i"])
+        self.assertFalse(second["images"][0]["shown"])          # SVG can carry script: never served
+        self.assertIn("image/svg+xml", second["notes"][0])
+        self.assertIsNone(store.step_image("wf_img-014", "a1", reads[1]["i"], 0))
+        self.assertIsNone(store.step_image("wf_img-014", "a1", reads[0]["i"], 5))
+        self.assertIsNone(store.step_image("wf_img-014", "nobody", reads[0]["i"], 0))
+        # over HTTP
+        server = ww.make_server(store, 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/image?run=wf_img-014&agent=a1&i=%d&n=0" % reads[0]["i"],
+                         headers={"Host": "127.0.0.1:%d" % port})
+            response = conn.getresponse()
+            body = response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), "image/png")
+            self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+            self.assertEqual(body, png)
+            conn.request("GET", "/api/image?run=wf_img-014&agent=a1&i=%d&n=0" % reads[1]["i"],
+                         headers={"Host": "127.0.0.1:%d" % port})
+            response = conn.getresponse()
+            response.read()
+            self.assertEqual(response.status, 404)
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class ConfigRoot(unittest.TestCase):

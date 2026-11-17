@@ -139,3 +139,38 @@ def transcript(start_ms, steps=2, prompt="Do the task.", tool="Bash", finish_tex
                         "message": {"id": "msg_end", "role": "assistant", "model": "claude-test-1",
                                     "content": [{"type": "text", "text": finish_text}]}})
     return entries
+
+
+def make_png(width=40, height=24, rgb=(40, 120, 220)):
+    """A small, valid PNG of one colour."""
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    row = b"\x00" + bytes(rgb) * width
+    raw = row * height
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def image_read_transcript(start_ms, images):
+    """An agent that reads image files. ``images`` is a list of
+    (file path, media type, bytes)."""
+    import base64
+    entries = [{"type": "user", "timestamp": iso(start_ms), "cwd": "/work/demo",
+                "message": {"role": "user", "content": "Look at the screenshots."}}]
+    t = start_ms
+    for i, (path, media, data) in enumerate(images):
+        t += 1000
+        entries.append({"type": "assistant", "timestamp": iso(t), "message": {
+            "id": "msg_img_%d" % i, "role": "assistant", "model": "claude-test-1",
+            "content": [{"type": "tool_use", "id": "tu_img_%d" % i, "name": "Read", "input": {"file_path": path}}]}})
+        t += 500
+        entries.append({"type": "user", "timestamp": iso(t), "toolUseResult": {"type": "image"}, "message": {
+            "role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_img_%d" % i, "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media,
+                                             "data": base64.b64encode(data).decode("ascii")}}]}]}})
+    return entries

@@ -80,8 +80,9 @@ last tool call and how long ago), its last message, what it returned (field
 names as headings, Markdown shown as Markdown), its prompt, and every step,
 newest on top. Open a step to see it in a form that fits the tool: a terminal
 for Bash, a diff for Edit, the file with line numbers and colours for Read and
-Write, the matches for Grep and Glob, the question and answer for WebFetch and
-WebSearch. The page updates the panel in place, so what you read does not
+Write, the image itself when the agent read an image (PNG, JPEG, GIF, WebP;
+click it to open it full size), the matches for Grep and Glob, the question and
+answer for WebFetch and WebSearch. The page updates the panel in place, so what you read does not
 move.
 
 ## Options

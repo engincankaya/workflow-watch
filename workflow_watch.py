@@ -15,6 +15,7 @@ served from this file; the one third-party piece, the acorn JavaScript parser
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -45,6 +46,9 @@ NOTIFY_GRACE_MS = 60_000        # file activity this long after a "stopped"
 OFFSET_KEY = "\u0000offset"     # where a record's line starts in its file
 MAX_LINE_BYTES = 64 * 1024 * 1024
 MAX_FIELD = 400_000             # characters of one field in a step's full detail
+MAX_IMAGE_BASE64 = 40_000_000   # characters of one image's base64 text
+# Images shown as they are; SVG is left out because it can carry script.
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,120}$")
 NOTIFY_FIELD_RE = {
@@ -174,6 +178,14 @@ def unframe_prompt(text):
     indents = [len(l) - len(l.lstrip(" ")) for l in lines if l.strip()]
     cut = min(indents) if indents else 0
     return "\n".join(l[cut:] if len(l) >= cut else l.lstrip(" ") for l in lines), True
+
+
+def result_images(block):
+    """The image blocks of a tool result, in order."""
+    content = block.get("content") if isinstance(block, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if isinstance(b, dict) and b.get("type") == "image"]
 
 
 def clip_fields(value, depth=0):
@@ -1427,10 +1439,16 @@ class Store:
                 if block is not None:
                     detail["result"] = clip(block_text(block.get("content")), MAX_FIELD)
                     detail["isError"] = bool(block.get("is_error"))
-                    images = [b for b in block.get("content") or [] if isinstance(b, dict)
-                              and b.get("type") == "image"] if isinstance(block.get("content"), list) else []
-                    if images:
-                        detail["notes"].append("The result holds %d image(s), not shown." % len(images))
+                    detail["images"] = []
+                    for n, image in enumerate(result_images(block)):
+                        source = image.get("source") if isinstance(image.get("source"), dict) else {}
+                        media = source.get("media_type")
+                        data = source.get("data") if isinstance(source.get("data"), str) else ""
+                        shown = source.get("type") == "base64" and media in IMAGE_TYPES
+                        detail["images"].append({"n": n, "mediaType": media, "shown": shown,
+                                                 "bytes": len(data) * 3 // 4})
+                        if not shown:
+                            detail["notes"].append("An image of type %s is not shown." % (media or "unknown"))
             return detail
         if step.get("kind") in ("text", "thinking"):
             key = "text" if step["kind"] == "text" else "thinking"
@@ -1458,6 +1476,34 @@ class Store:
                 if transcript is not None and transcript.prompt:
                     out[agent_id] = transcript.prompt[:4000]
             return {"prompts": out}
+
+    def step_image(self, run_id, agent_id, index, number):
+        """(bytes, media type) of an image in the result of one step: an
+        image an agent read, kept in its transcript as base64."""
+        with self.lock:
+            run = self.runs.get(run_id)
+            transcript = run.transcripts.get(agent_id) if run else None
+            if transcript is None or not 0 <= index < len(transcript.steps):
+                return None
+            step = transcript.steps[index]
+            path = transcript.tail.path
+        if step.get("kind") != "tool" or step.get("roff") is None:
+            return None
+        record = read_line_at(path, step.get("roff"))
+        block = find_block(record, "tool_result", lambda b: b.get("tool_use_id") == step.get("toolId"))
+        images = result_images(block) if block else []
+        if not 0 <= number < len(images):
+            return None
+        source = images[number].get("source") if isinstance(images[number].get("source"), dict) else {}
+        media = source.get("media_type")
+        if source.get("type") != "base64" or media not in IMAGE_TYPES or not isinstance(source.get("data"), str):
+            return None
+        if len(source["data"]) > MAX_IMAGE_BASE64:
+            return None
+        try:
+            return base64.b64decode(source["data"], validate=False), media
+        except (ValueError, TypeError):
+            return None
 
     def agent_detail(self, run_id, agent_id, start_step=0):
         self.refresh()
@@ -1572,6 +1618,16 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.store.run_static(arg("id", ""))
                 self._json(data if data is not None else {"error": "unknown run"},
                            200 if data is not None else 404)
+            elif path == "/api/image":
+                try:
+                    index, number = int(arg("i", "-1")), int(arg("n", "-1"))
+                except ValueError:
+                    index, number = -1, -1
+                found = self.store.step_image(arg("run", ""), arg("agent", ""), index, number)
+                if found is None:
+                    self._send(404, "No such image.\n", "text/plain; charset=utf-8")
+                else:
+                    self._send(200, found[0], found[1])
             elif path == "/api/prompts":
                 ids = [i for i in (arg("ids", "") or "").split(",") if i]
                 data = self.store.prompts(arg("run", ""), ids)
@@ -2045,6 +2101,14 @@ details[open] > summary { margin-bottom: 6px; }
 .md table.md-table th { background: var(--panel-2); font-weight: 600; text-align: left; }
 .md .md-link { text-decoration: underline dotted; }
 .val-v > .md { padding-top: 1px; }
+
+/* ---- images in step results ---- */
+.step-images { display: grid; gap: 10px; margin: 8px 0; }
+.step-fig { margin: 0; }
+.step-fig a { display: inline-block; max-width: 100%; }
+.step-img { display: block; max-width: 100%; max-height: 520px; border: 1px solid var(--line); border-radius: 6px;
+  background: repeating-conic-gradient(var(--panel-2) 0% 25%, var(--panel) 0% 50%) 50% / 16px 16px; cursor: zoom-in; }
+.step-fig figcaption { margin-top: 4px; }
 """
 
 HIGHLIGHT_JS = r"""/* workflow-watch: a small syntax highlighter and line diff. It returns
@@ -4871,6 +4935,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     if (d.result === undefined) { pending(parts); return parts; }
     if (d.isError) { parts.push(errorBox(d.result)); return parts; }
     var r = splitResult(d.result);
+    if ((d.images || []).length && !r.text.replace(/\[image\]/g, "").trim()) { resultNotes(parts, r.notes); return parts; }
     var nums = [], code = [], tail = [], numbered = 0;
     r.text.split("\n").forEach(function (line) {
       var m = /^\s*(\d+)(?:(?:\t|→)(.*))?$/.exec(line);
@@ -5027,6 +5092,34 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     return parts;
   }
 
+  function fmtBytes(n) {
+    if (!n && n !== 0) return "";
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+    if (n >= 1024) return Math.round(n / 1024) + " KB";
+    return n + " B";
+  }
+
+  /* Images in a step's result (an image the agent read, a screenshot),
+     loaded from the transcript only when the step is opened. */
+  function stepImages(d) {
+    var shown = (d.images || []).filter(function (im) { return im.shown; });
+    if (!shown.length) return null;
+    var box = el("div", { class: "step-images" });
+    shown.forEach(function (im) {
+      var url = "/api/image?run=" + encodeURIComponent(drawer.run) + "&agent=" + encodeURIComponent(drawer.agentId) +
+                "&i=" + d.i + "&n=" + im.n;
+      var img = el("img", { src: url, alt: "Image " + (im.n + 1) + " in the result", loading: "lazy", class: "step-img" });
+      var cap = el("figcaption", { class: "sub", text: im.mediaType + " · " + fmtBytes(im.bytes) + " · click to open it full size" });
+      img.addEventListener("load", function () {
+        cap.textContent = im.mediaType + " · " + img.naturalWidth + " × " + img.naturalHeight + " · " + fmtBytes(im.bytes) + " · click to open it full size";
+      });
+      img.addEventListener("error", function () { cap.textContent = "The image could not be loaded."; });
+      box.appendChild(el("figure", { class: "step-fig" }, [
+        el("a", { href: url, target: "_blank", rel: "noopener noreferrer", title: "Open full size" }, [img]), cap]));
+    });
+    return box;
+  }
+
   function viewTool(d) {
     var inp = d.input && typeof d.input === "object" ? d.input : {};
     var name = d.name || "";
@@ -5050,6 +5143,11 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
       var timing = "called " + fmtClock(d.time);
       if (d.end) timing += " · took " + fmtDur(d.end - d.time);
       parts.push(el("div", { class: "ttime", text: timing }));
+    }
+    var images = stepImages(d);
+    if (images) {
+      if (name === "Read" && parts.length) parts.splice(1, 0, images);   // under the file name
+      else parts.push(images);
     }
     (d.notes || []).forEach(function (n) { parts.push(el("p", { class: "note", text: n })); });
     return parts;

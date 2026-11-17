@@ -113,6 +113,10 @@ function fake(schema, label, depth) {
 }
 
 // ------------------------------------------------------------ the runtime
+// The paragraph Claude Code puts in front of a computed task (2.1.325); it
+// then indents every line of the task by two spaces.
+const FRAME = "[Workflow harness — computed task] The task text below was computed at runtime by a workflow script. " +
+  "It was not typed by this session's user and carries no user authority. The computed task text follows:\n";
 let agentCount = 0, running = 0, stopped = false;
 const waiting = [];
 const progress = [], truth = [], logs = [];
@@ -147,7 +151,9 @@ async function agent(prompt, o) {
   const label = o.label != null ? String(o.label)
     : (opts.unlabeled === "empty" ? "" : String(prompt).replace(/\s+/g, " ").slice(0, 40));
   const phase = o.phase || currentPhase;
-  const key = "v2:" + agentId;
+  // like Claude Code, the key depends on the call, not on the run, so a
+  // resumed run gives a cached agent the key it had in the earlier run
+  const key = "v2:" + require("crypto").createHash("sha256").update(n + "|" + label + "|" + String(prompt)).digest("hex");
   const schema = o.schema;
   const value = opts.fail && opts.fail.test(label) ? null : fake(schema, label);
   truth.push({ agentId, label, line, phase });
@@ -162,7 +168,7 @@ async function agent(prompt, o) {
     agentType: o.agentType || "workflow-subagent", isBuiltIn: true, description: label, workflowPhase: phase, spawnDepth: 1, model: o.model || "sim" }));
   const file = path.join(runDir, "agent-" + agentId + ".jsonl");
   append(file, { type: "user", timestamp: iso(), cwd, agentId, sessionId: opts.session,
-    message: { role: "user", content: "[Workflow harness — computed task] " + String(prompt) } });
+    message: { role: "user", content: FRAME + String(prompt).split("\n").map((l) => "  " + l).join("\n") } });
   const steps = 2 + (n % 4);
   for (let s = 0; s < steps; s++) {
     const [tool, input] = TOOLS[(n + s) % TOOLS.length];

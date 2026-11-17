@@ -46,7 +46,7 @@ OFFSET_KEY = "\u0000offset"     # where a record's line starts in its file
 MAX_LINE_BYTES = 64 * 1024 * 1024
 MAX_FIELD = 400_000             # characters of one field in a step's full detail
 
-RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]+$")
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,120}$")
 NOTIFY_FIELD_RE = {
     name: re.compile(r"<%s>(.*?)</%s>" % (name, name), re.S)
     for name in ("task-id", "tool-use-id", "status", "summary")
@@ -152,6 +152,25 @@ def tool_summary(name, tool_input):
         if isinstance(value, str) and value.strip():
             return value.strip().splitlines()[0][:200]
     return preview(tool_input, 160) or ""
+
+
+HARNESS_RE = re.compile(r"^\[Workflow harness[^\]]*\][^\n]*?(?::\n|\n)", re.S)
+
+
+def unframe_prompt(text):
+    """(task text, framed). Claude Code puts a paragraph in front of a
+    computed task and indents every line of the task; this takes both off.
+    Text without that frame comes back unchanged."""
+    if not text.startswith("[Workflow harness"):
+        return text, False
+    match = HARNESS_RE.match(text)
+    if not match:
+        return text, False
+    body = text[match.end():]
+    lines = body.split("\n")
+    indents = [len(l) - len(l.lstrip(" ")) for l in lines if l.strip()]
+    cut = min(indents) if indents else 0
+    return "\n".join(l[cut:] if len(l) >= cut else l.lstrip(" ") for l in lines), True
 
 
 def clip_fields(value, depth=0):
@@ -456,6 +475,7 @@ class AgentTranscript:
 
     def reset(self):
         self._offset = None
+        self.prompt_framed = False
         self.first_time = None
         self.last_time = None
         self.prompt = None
@@ -538,8 +558,8 @@ class AgentTranscript:
         content = message.get("content")
         if isinstance(content, str):
             if self.prompt is None or "computed task" in content[:200]:
-                if self.prompt is None or "computed task" in content[:200]:
-                    self.prompt = content[:MAX_PROMPT]
+                self.prompt, self.prompt_framed = unframe_prompt(content)
+                self.prompt = self.prompt[:MAX_PROMPT]
             if not self.steps and "[Workflow harness" in content[:40]:
                 return
             if self.steps:
@@ -835,7 +855,7 @@ class Run:
             view["outputTokens"] = output
             view["lastActivity"] = transcript.last_activity
             view["lastTool"] = transcript.last_tool
-            view["lastText"] = transcript.last_text
+            view["lastText"] = transcript.last_text if state == "running" else None
             view["errors"] = transcript.errors
             if state in ("done", "failed"):
                 end = transcript.last_time
@@ -972,7 +992,30 @@ class Store:
 
     # -- views ------------------------------------------------------------------
 
+    def _fill_cached_labels(self, run):
+        """A result line without a start line (a result replayed from cache
+        when a run is resumed) has no label. The same call has the same key
+        in the earlier run of the session, whose start line has it."""
+        missing = [a for a in run.agents.values() if not a.get("label") and a.get("key")]
+        if not missing:
+            return
+        known = {}
+        for other in self.runs.values():
+            if other is run or other.session_dir != run.session_dir:
+                continue
+            if not other.agents and other.journal.offset == 0:
+                other.refresh(full=False)
+            for agent in other.agents.values():
+                if agent.get("key") and agent.get("label"):
+                    known.setdefault(agent["key"], agent)
+        for agent in missing:
+            source = known.get(agent["key"])
+            if source:
+                agent["label"] = source["label"]
+                agent["phase"] = agent.get("phase") or source.get("phase")
+
     def run_summary(self, run, now_ms):
+        self._fill_cached_labels(run)
         launch, launch_result, index = self.launch_for(run.run_id)
         record = run.record or {}
         task_id = record.get("taskId") or (launch_result or {}).get("taskId")
@@ -1137,8 +1180,53 @@ class Store:
                                       "edited after the run started." % path_text)
             return None, None, "The script file %s could not be read (%s)." % (path_text, error)
         if isinstance(tool_input.get("name"), str):
-            return None, None, "Saved workflow %s: its script is not in the transcript." % tool_input["name"]
+            found = self.find_saved_workflow(tool_input["name"], launch.get("cwd"))
+            if found:
+                text, where = found
+                return text, "saved", ("The script was read from the saved workflow %s now; it may "
+                                       "have changed since the run started." % where)
+            return None, None, ("Workflow %s was started by name and its script file was not found "
+                                "(a bundled workflow has no file)." % tool_input["name"])
         return None, None, None
+
+    def find_saved_workflow(self, name, cwd):
+        """(script, path) of a saved workflow: <dir>/.claude/workflows of the
+        project folder and its parents, the personal workflows folder, and
+        the workflows folders of installed plugins ("plugin:name")."""
+        plugin, _, short = name.rpartition(":")
+        folders = []
+        if cwd:
+            here = Path(cwd)
+            for folder in [here] + list(here.parents)[:40]:
+                folders.append(folder / ".claude" / "workflows")
+        config = self.root.parent          # the root is <config>/projects
+        folders.append(config / "workflows")
+        plugins = config / "plugins"
+        if plugin and plugins.is_dir():
+            for dirpath, dirnames, _files in os.walk(str(plugins)):
+                depth = Path(dirpath).relative_to(plugins).parts
+                if len(depth) > 6:
+                    dirnames[:] = []
+                    continue
+                if Path(dirpath).name == "workflows":
+                    folders.append(Path(dirpath))
+        for folder in folders:
+            if not folder.is_dir():
+                continue
+            candidates = sorted(folder.glob("*.js")) + sorted(folder.glob("*.mjs"))
+            for path in candidates:
+                if path.stem == short:
+                    text, _error = read_text_file(path)
+                    if text is not None:
+                        return text, str(path)
+            for path in candidates:
+                text, _error = read_text_file(path)
+                if text is None:
+                    continue
+                match = SCRIPT_NAME_RE.search(text)
+                if match and match.group(2) in (short, name):
+                    return text, str(path)
+        return None
 
     def run_detail(self, run_id, version=None):
         self.refresh()
@@ -1224,6 +1312,12 @@ class Store:
                         script, origin = text, "file"
                         note = ("The script was read from %s now; it may have been edited "
                                 "after the run started." % script_path)
+            if script is None and record.get("workflowName") and not launch:
+                found = self.find_saved_workflow(record["workflowName"], self._session_cwd(run))
+                if found:
+                    script, origin = found[0], "saved"
+                    note = ("The script was read from the saved workflow %s now; it may have "
+                            "changed since the run started." % found[1])
             if script is None:
                 for path in safe_listdir(run.session_dir / "workflows" / "scripts"):
                     if path.name.endswith("-%s.js" % run_id):
@@ -1302,6 +1396,24 @@ class Store:
         detail["text"] = step.get("text")
         return detail
 
+    def prompts(self, run_id, agent_ids):
+        """The start of each agent's task text, for matching agents to the
+        script when their labels do not say enough."""
+        self.refresh()
+        with self.lock:
+            run = self.runs.get(run_id)
+            if run is None:
+                return None
+            if not run.detail_loaded:
+                run.detail_loaded = True
+                run.refresh(full=True)
+            out = {}
+            for agent_id in agent_ids[:500]:
+                transcript = run.transcripts.get(agent_id)
+                if transcript is not None and transcript.prompt:
+                    out[agent_id] = transcript.prompt[:4000]
+            return {"prompts": out}
+
     def agent_detail(self, run_id, agent_id, start_step=0):
         self.refresh()
         now_ms = time.time() * 1000
@@ -1335,6 +1447,7 @@ class Store:
                 "hasResult": bool(base.get("hasResult")),
                 "cwd": transcript.cwd if transcript else None,
                 "gitBranch": transcript.git_branch if transcript else None,
+                "promptFramed": bool(transcript and transcript.prompt_framed),
             }
 
 
@@ -1412,6 +1525,11 @@ class Handler(BaseHTTPRequestHandler):
                            200 if data is not None else 404)
             elif path == "/api/static":
                 data = self.store.run_static(arg("id", ""))
+                self._json(data if data is not None else {"error": "unknown run"},
+                           200 if data is not None else 404)
+            elif path == "/api/prompts":
+                ids = [i for i in (arg("ids", "") or "").split(",") if i]
+                data = self.store.prompts(arg("run", ""), ids)
                 self._json(data if data is not None else {"error": "unknown run"},
                            200 if data is not None else 404)
             elif path == "/api/step":
@@ -1736,14 +1854,22 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 details[open] > summary { margin-bottom: 6px; }
 
 /* value renderer */
-.val-obj { margin: 0; display: grid; grid-template-columns: minmax(80px, max-content) 1fr; gap: 3px 10px; }
-.val-obj > dt { color: var(--muted); font-size: 12.5px; font-weight: 600; word-break: break-word; }
-.val-obj > dd { margin: 0; min-width: 0; }
+.val-obj { margin: 0; }
+.val-field { margin: 0 0 14px; }
+.val-field:last-child { margin-bottom: 0; }
+.val-key { font-weight: 650; color: var(--text); line-height: 1.3; margin-bottom: 5px; word-break: break-word; }
+.val-d0 > .val-field > .val-key { font-size: 15.5px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+.val-d1 > .val-field > .val-key { font-size: 14px; }
+.val-d2 > .val-field > .val-key, .val-d3 > .val-field > .val-key { font-size: 13px; color: var(--muted); }
+.val-d1, .val-d2, .val-d3 { border-left: 2px solid var(--line); padding-left: 12px; }
+.val-v { min-width: 0; }
 .val-list { margin: 0; padding-left: 20px; }
-.val-list > li { margin: 2px 0; }
+.val-list > li { margin: 3px 0; }
+.val-list.val-cards > li { margin: 8px 0 12px; }
+.val-list.val-cards > li::marker { color: var(--muted); font-weight: 600; }
 .val-str { white-space: pre-wrap; word-break: break-word; }
 .val-lit { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; color: var(--done); }
-.val-nested { border-left: 2px solid var(--line); padding-left: 8px; }
+
 
 @media (max-width: 720px) {
   main { padding: 10px; }
@@ -1871,7 +1997,7 @@ details[open] > summary { margin-bottom: 6px; }
 .md table.md-table th, .md table.md-table td { border: 1px solid var(--line); padding: 4px 10px; vertical-align: top; }
 .md table.md-table th { background: var(--panel-2); font-weight: 600; text-align: left; }
 .md .md-link { text-decoration: underline dotted; }
-.val-obj > dd > .md { padding-top: 1px; }
+.val-v > .md { padding-top: 1px; }
 """
 
 HIGHLIGHT_JS = r"""/* workflow-watch: a small syntax highlighter and line diff. It returns
@@ -2475,9 +2601,10 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
         var pre = [];
         if (node.type === "ForStatement" && node.init) pre = this.stmtOrExpr(node.init, ctx);
         if ((node.type === "ForOfStatement" || node.type === "ForInStatement") && node.right) pre = this.expr(node.right, ctx);
-        var body = this.block(node.body, Object.assign({}, ctx, { loop: true }));
+        var vars = loopVariables(node);
+        var body = this.block(node.body, Object.assign({}, ctx, { loop: true, loopVars: (ctx.loopVars || []).concat(vars) }));
         if (hasAgent(body)) {
-          pre.push({ k: "loop", id: this.id("l"), title: this.loopTitle(node), line: node.loc.start.line, body: body });
+          pre.push({ k: "loop", id: this.id("l"), title: this.loopTitle(node), line: node.loc.start.line, body: body, vars: vars });
         }
         return pre;
       case "BlockStatement":
@@ -2518,6 +2645,71 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     return "loop";
   };
 
+  /* Visit every AST node below ``node`` (not into nested functions when
+     ``shallow`` is set). */
+  function walkAst(node, visit, shallow) {
+    if (!node || typeof node.type !== "string") return;
+    if (visit(node) === false) return;
+    Object.keys(node).forEach(function (k) {
+      if (k === "loc" || k === "start" || k === "end") return;
+      var v = node[k];
+      if (Array.isArray(v)) v.forEach(function (c) { if (c && typeof c.type === "string") walkInto(c); });
+      else if (v && typeof v.type === "string") walkInto(v);
+    });
+    function walkInto(c) {
+      if (shallow && /Function/.test(c.type)) return;
+      walkAst(c, visit, shallow);
+    }
+  }
+
+  function identifiersIn(node) {
+    var names = [];
+    walkAst(node, function (n) { if (n.type === "Identifier" && names.indexOf(n.name) < 0) names.push(n.name); });
+    return names;
+  }
+
+  /* The variables that change from one round of a loop to the next: those it
+     declares, and those its test, update or body increment or assign. */
+  function loopVariables(node) {
+    var vars = [];
+    function add(name) { if (name && vars.indexOf(name) < 0) vars.push(name); }
+    function addPattern(p) { identifiersIn(p).forEach(add); }
+    if (node.type === "ForStatement" && node.init && node.init.type === "VariableDeclaration") node.init.declarations.forEach(function (d) { addPattern(d.id); });
+    if ((node.type === "ForOfStatement" || node.type === "ForInStatement") && node.left) {
+      if (node.left.type === "VariableDeclaration") node.left.declarations.forEach(function (d) { addPattern(d.id); });
+      else addPattern(node.left);
+    }
+    [node.update, node.test, node.body].forEach(function (part) {
+      walkAst(part, function (n) {
+        if (n.type === "UpdateExpression" && n.argument.type === "Identifier") add(n.argument.name);
+        if (n.type === "AssignmentExpression" && n.left.type === "Identifier" && /^[-+*]?=$/.test(n.operator) && n.operator !== "=") add(n.left.name);
+        if (n.type === "AssignmentExpression" && n.left.type === "Identifier" && n.operator === "=" && n.right.type === "BinaryExpression") {
+          if (identifiersIn(n.right).indexOf(n.left.name) >= 0) add(n.left.name);   // round = round + 1
+        }
+      }, true);
+    });
+    return vars;
+  }
+
+  /* Literal pieces of a prompt expression, longest first, to recognise the
+     agent's prompt at run time when it has no label to go by. */
+  function promptFragments(node) {
+    var frags = [];
+    function add(text) {
+      String(text).split(/\$\{|\n/).forEach(function (part) {
+        part = part.trim();
+        if (part.length >= 6) frags.push(part.length > 120 ? part.slice(0, 120) : part);
+      });
+    }
+    walkAst(node, function (n) {
+      if (n.type === "Literal" && typeof n.value === "string") add(n.value);
+      if (n.type === "TemplateElement") add(n.value.cooked == null ? n.value.raw : n.value.cooked);
+      if (n.type === "CallExpression" || /Function/.test(n.type)) return false;
+    });
+    frags.sort(function (a, b) { return b.length - a.length; });
+    return frags.slice(0, 6);
+  }
+
   function calleeName(node) {
     if (node.type === "Identifier") return node.name;
     return null;
@@ -2545,10 +2737,11 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
 
   Builder.prototype.agentNode = function (call, ctx) {
     var node = { k: "agent", id: this.id("a"), line: call.loc.start.line,
-                 label: null, labelRe: null, labelLiteral: 0, phase: ctx.phase || null,
-                 phaseStatic: false, model: null, schema: false, isolation: null, prompt: null };
+                 label: null, labelRe: null, labelLiteral: 0, labelExprs: [], phase: ctx.phase || null,
+                 phaseStatic: false, model: null, schema: false, isolation: null, prompt: null,
+                 loopVars: (ctx.loopVars || []).slice(), eachVars: (ctx.eachVars || []).slice(), promptFrags: [] };
     var promptArg = call.arguments[0];
-    if (promptArg) node.prompt = this.text(promptArg, 140);
+    if (promptArg) { node.prompt = this.text(promptArg, 140); node.promptFrags = promptFragments(promptArg); }
     var props = this.resolveOpts(call.arguments[1], {}, 0);
     if (props) {
       var self = this;
@@ -2639,6 +2832,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
         if (i < value.expressions.length) {
           shown += "${" + self.text(value.expressions[i], 24) + "}";
           re += "([\\s\\S]*?)";
+          node.labelExprs.push(identifiersIn(value.expressions[i]));
         }
       });
       node.label = shown;
@@ -2651,7 +2845,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
       var parts = flattenPlus(value), label = "", rx = "^", n = 0, me = this;
       parts.forEach(function (p) {
         if (p.type === "Literal" && typeof p.value === "string") { label += p.value; rx += escapeRe(p.value); n += p.value.length; }
-        else { label += "${" + me.text(p, 24) + "}"; rx += "([\\s\\S]*?)"; }
+        else { label += "${" + me.text(p, 24) + "}"; rx += "([\\s\\S]*?)"; node.labelExprs.push(identifiersIn(p)); }
       });
       node.label = label; node.labelRe = rx + "$"; node.labelLiteral = n;
       return;
@@ -2725,8 +2919,17 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     return out;
   };
 
+  /* The body of a callback that runs once per item (map, pipeline stage,
+     Array.from). Its parameters name the item; agents inside remember them,
+     one list per fan-out level, to tell items apart by their labels. */
   Builder.prototype.fanoutBody = function (fn, ctx) {
-    return this.fnBody(fn, Object.assign({}, ctx, { inFn: true }));
+    var target = fn && fn.type === "Identifier" && this.fns[fn.name] ? this.fns[fn.name] : fn;
+    var vars = [];
+    if (isFn(target)) {
+      target.params.forEach(function (p) { identifiersIn(p).forEach(function (n) { vars.push(n); }); });
+      if (isFn(target.body)) target.body.params.forEach(function (p) { identifiersIn(p).forEach(function (n) { vars.push(n); }); });
+    }
+    return this.fnBody(fn, Object.assign({}, ctx, { inFn: true, eachVars: (ctx.eachVars || []).concat([vars]) }));
   };
 
   Builder.prototype.call = function (node, ctx) {
@@ -2755,7 +2958,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
       });
       var items = [];
       stages.forEach(function (s) { items = items.concat(s.seq.items); });
-      return this.expr(args[0], ctx).concat([{ k: "each", id: this.id("e"), kind: "pipeline",
+      return this.expr(args[0], ctx).concat([{ k: "each", id: this.id("e"), kind: "pipeline", level: (ctx.eachVars || []).length,
         title: "pipeline over " + (args[0] ? this.text(args[0], 50) : "items"), line: node.loc.start.line,
         body: { k: "seq", items: items } }]);
     }
@@ -2766,7 +2969,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
     if (member === "from" && node.callee.object.type === "Identifier" && node.callee.object.name === "Array" && args[1]) {
       var body = this.fanoutBody(args[1], ctx);
       if (hasAgent(body)) {
-        return [{ k: "each", id: this.id("e"), kind: "times", title: "repeat " + this.text(args[0], 40),
+        return [{ k: "each", id: this.id("e"), kind: "times", level: (ctx.eachVars || []).length, title: "repeat " + this.text(args[0], 40),
                   line: node.loc.start.line, body: body }];
       }
       return [];
@@ -2776,7 +2979,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
       var fbody = this.fanoutBody(fnArg, ctx);
       var before = this.expr(node.callee.object, ctx);
       if (hasAgent(fbody)) {
-        return before.concat([{ k: "each", id: this.id("e"), kind: member,
+        return before.concat([{ k: "each", id: this.id("e"), kind: member, level: (ctx.eachVars || []).length,
           title: "for each of " + this.text(node.callee.object, 50), line: node.loc.start.line, body: fbody }]);
       }
       return before;
@@ -2808,7 +3011,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
       arg.elements.forEach(function (el, i) {
         if (!el) return;
         if (el.type === "SpreadElement") { loose = loose.concat(self.expr(el.argument, ctx)); return; }
-        var seq = promises ? { k: "seq", items: self.expr(el, ctx) } : self.fanoutBody(el, ctx);
+        var seq = promises ? { k: "seq", items: self.expr(el, ctx) } : self.fnBody(el, Object.assign({}, ctx, { inFn: true }));
         if (interesting(seq)) branches.push({ label: "", seq: seq });
       });
       var out = [];
@@ -2874,30 +3077,51 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
 
   // -------------------------------------------------------------- match
 
-  /* Give each run agent a node of the graph. Returns
-     { byNode: {nodeId: [agent, ...]}, unmatched: [agent, ...] } */
-  function matchAgents(graph, agents) {
-    var byNode = {}, unmatched = [], lastUnlabeled = null;
-    var nodes = graph.agents;
-    var compiled = nodes.map(function (n) {
+  /* Give each run agent a node of the graph, by (1) its label against the
+     label templates, (2) its prompt against the literal text of the prompts,
+     (3) script order among the nodes we could not read. ``prompts`` maps an
+     agent id to the start of its task text, when the page has it. Returns
+     { byNode: {nodeId: [agent, ...]}, nodeOf: {agentId: node}, unmatched } */
+  function matchAgents(graph, agents, prompts) {
+    var byNode = {}, nodeOf = {}, unmatched = [], lastUnlabeled = null;
+    var compiled = graph.agents.map(function (n) {
       var re = null;
       if (n.labelRe) { try { re = new RegExp(n.labelRe); } catch (e) { re = null; } }
-      return { node: n, re: re };
+      var fragLen = (n.promptFrags || []).reduce(function (s, f) { return s + f.length; }, 0);
+      return { node: n, re: re, fragLen: fragLen };
     });
+    function byPhase(cands, a) {
+      if (cands.length > 1 && a.phase) {
+        var same = cands.filter(function (c) { return c.node.phaseStatic && c.node.phase === a.phase; });
+        if (same.length) return same;
+        var notOther = cands.filter(function (c) { return !(c.node.phaseStatic && c.node.phase !== a.phase); });
+        if (notOther.length) return notOther;
+      }
+      return cands;
+    }
     agents.forEach(function (a) {
       var exact = compiled.filter(function (c) { return c.node.exactAgent === a.agentId; });
-      var cands = exact.length ? exact : compiled.filter(function (c) { return c.re && c.re.test(a.label || ""); });
-      if (cands.length > 1 && a.phase) {
-        var samePhase = cands.filter(function (c) { return c.node.phaseStatic && c.node.phase === a.phase; });
-        if (samePhase.length) cands = samePhase;
-        else {
-          var notOther = cands.filter(function (c) { return !(c.node.phaseStatic && c.node.phase !== a.phase); });
-          if (notOther.length) cands = notOther;
+      var cands = exact.length ? exact : byPhase(compiled.filter(function (c) { return c.re && c.re.test(a.label || ""); }), a);
+      if (cands.length > 1) {
+        // the most specific template wins: more literal text
+        var best = Math.max.apply(null, cands.map(function (c) { return c.node.labelLiteral || 0; }));
+        cands = cands.filter(function (c) { return (c.node.labelLiteral || 0) === best; });
+      }
+      var prompt = prompts && prompts[a.agentId];
+      if (!cands.length && prompt) {
+        var scored = compiled.filter(function (c) { return !c.node.exactAgent && c.fragLen; }).map(function (c) {
+          var got = 0;
+          c.node.promptFrags.forEach(function (f) { if (prompt.indexOf(f) >= 0) got += f.length; });
+          return { c: c, score: got / c.fragLen, got: got };
+        }).filter(function (x) { return x.score >= 0.5; });
+        if (scored.length) {
+          var top = Math.max.apply(null, scored.map(function (x) { return x.score * 1000 + Math.min(x.got, 999); }));
+          cands = byPhase(scored.filter(function (x) { return x.score * 1000 + Math.min(x.got, 999) === top; }).map(function (x) { return x.c; }), a);
         }
       }
       if (!cands.length) {
-        // nodes whose label we could not read: match by phase, then take
-        // them in script order, one agent each, the last one repeating
+        // nodes whose label and prompt we could not read: by phase, then in
+        // script order, one agent each, the last one repeating
         cands = compiled.filter(function (c) {
           return !c.re && !c.node.exactAgent && (!a.phase || !c.node.phase || c.node.phase === a.phase);
         });
@@ -2913,16 +3137,12 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
         }
         if (cands.length) lastUnlabeled = cands[0].node.id;
       }
-      if (cands.length > 1) {
-        cands = cands.slice().sort(function (x, y) { return (y.node.labelLiteral || 0) - (x.node.labelLiteral || 0); });
-        var best = cands[0].node.labelLiteral || 0;
-        cands = cands.filter(function (c) { return (c.node.labelLiteral || 0) === best; });
-      }
       if (!cands.length) { unmatched.push(a); return; }
       var target = cands[0].node;   // first in script order among the best
       (byNode[target.id] = byNode[target.id] || []).push(a);
+      nodeOf[a.agentId] = target;
     });
-    return { byNode: byNode, unmatched: unmatched };
+    return { byNode: byNode, nodeOf: nodeOf, unmatched: unmatched };
   }
 
   // ------------------------------------------------------------- layout
@@ -3030,86 +3250,155 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
   /* The run agents shown by one node of the (possibly expanded) graph. */
   function instancesFor(node, match) {
     if (!node || !match) return [];
-    if (node.baseId) {
-      var all = (match.columns && match.columns[node.baseId]) || match.byNode[node.baseId] || [];
-      return all[node.instanceIndex] ? [all[node.instanceIndex]] : [];
-    }
+    if (node.bound) return node.bound;
     return match.byNode[node.id] || [];
   }
 
-  function bindClone(node, index) {
-    var copy = Object.assign({}, node);
-    if (node.id) copy.id = node.id + "#" + index;
-    if (node.k === "agent") { copy.baseId = node.id; copy.instanceIndex = index; }
-    if (node.items) copy.items = node.items.map(function (n) { return bindClone(n, index); });
-    if (node.branches) copy.branches = node.branches.map(function (b) { return { label: b.label, seq: bindClone(b.seq, index) }; });
-    if (node.body) copy.body = bindClone(node.body, index);
-    return copy;
-  }
-
-  /* Draw each started item of a fan-out (parallel map, pipeline) as its own
-     column, so every parallel agent has its own node. Above ``limit`` items
-     the fan-out stays one node with a count. Returns {graph, signature}. */
-  /* The values a label template captured, as one key: "review:${f}" and
-     "verify:${f}" give the same key for the same item. */
-  function captureKey(node, agent) {
-    if (!node.labelRe) return null;
+  /* The values a label template captured for one agent, or null. */
+  function captures(node, agent) {
+    if (!node || !node.labelRe) return null;
     try {
       var m = new RegExp(node.labelRe).exec(agent.label || "");
-      return m && m.length > 1 ? m.slice(1).join("\u0001") : null;
+      return m ? m.slice(1) : null;
     } catch (e) { return null; }
   }
 
-  /* Put the agents of each step of a fan-out into columns: one column per
-     item. Agents whose labels carry the same item value share a column;
-     the rest fill free columns in start order. */
-  function assignColumns(agentNodes, match, count) {
-    var keys = [];
-    agentNodes.forEach(function (an) {
-      if (keys.length) return;
-      var inst = match.byNode[an.id] || [];
-      if (inst.length) keys = inst.map(function (a) { return captureKey(an, a); });
+  /* The captured values that name the item, not the round: values of
+     expressions that use a loop variable are left out. */
+  function itemParts(node, agent, level) {
+    var values = captures(node, agent);
+    if (!values) return null;
+    var loopVars = node.loopVars || [];
+    var deeper = [];
+    (node.eachVars || []).forEach(function (vars, j) { if (level !== undefined && j > level) deeper = deeper.concat(vars); });
+    var parts = [];
+    values.forEach(function (v, i) {
+      var ids = (node.labelExprs || [])[i] || [];
+      if (ids.some(function (id) { return loopVars.indexOf(id) >= 0 || deeper.indexOf(id) >= 0; })) return;
+      parts.push(v);
     });
-    match.columns = match.columns || {};
-    agentNodes.forEach(function (an) {
-      var inst = match.byNode[an.id] || [];
-      var placed = new Array(count), rest = [];
-      inst.forEach(function (a) {
-        var k = captureKey(an, a), idx = k === null ? -1 : keys.indexOf(k);
-        while (idx >= 0 && placed[idx]) idx = keys.indexOf(k, idx + 1);
-        if (idx >= 0 && idx < count) placed[idx] = a; else rest.push(a);
-      });
-      for (var i = 0; i < count && rest.length; i++) if (!placed[i]) placed[i] = rest.shift();
-      match.columns[an.id] = placed;
-    });
+    return parts.length ? parts : null;
   }
 
+  function containsAll(haystack, parts) {
+    return parts.every(function (p) { return haystack.indexOf(p) >= 0; });
+  }
+
+  /* Split the agents of a fan-out into one column per item. The first step
+     that has started agents sets the columns: by the item its labels name
+     when they all name one, else by start order. Agents of later steps join
+     the column whose item their label also names, else go by start order.
+     The same item in several rounds of a loop stays one column.
+     Returns {count, filters: [agent -> bool]}. */
+  function columnsFor(agentNodes, match, filter, level) {
+    var pools = agentNodes.map(function (an) {
+      var all = match.byNode[an.id] || [];
+      return filter ? all.filter(filter) : all;
+    });
+    var primary = -1;
+    pools.forEach(function (pool, n) { if (primary < 0 && pool.length) primary = n; });
+    if (primary < 0) return { count: 0, filters: [] };
+    var colOf = {}, keys = [];
+    var keyed = pools[primary].every(function (a) { return itemParts(agentNodes[primary], a, level); });
+    if (keyed) {
+      pools[primary].forEach(function (a) {
+        var parts = itemParts(agentNodes[primary], a, level), k = parts.join("\u0001");
+        var i = keys.findIndex ? keys.findIndex(function (x) { return x.k === k; }) : -1;
+        if (i < 0) { keys.push({ k: k, parts: parts }); i = keys.length - 1; }
+        colOf[a.agentId] = i;
+      });
+    } else {
+      pools[primary].forEach(function (a, i) { colOf[a.agentId] = i; });
+    }
+    var count = keyed ? keys.length : pools[primary].length;
+    pools.forEach(function (pool, n) {
+      if (n === primary) return;
+      pool.forEach(function (a, i) {
+        var col = -1;
+        if (keyed) {
+          var values = captures(agentNodes[n], a) || [];
+          for (var c = 0; c < keys.length && col < 0; c++) if (containsAll(values, keys[c].parts)) col = c;
+        }
+        if (col < 0) col = i % Math.max(count, 1);
+        colOf[a.agentId] = col;
+      });
+    });
+    var filters = [];
+    for (var i = 0; i < count; i++) (function (col) { filters.push(function (a) { return colOf[a.agentId] === col; }); })(i);
+    return { count: count, filters: filters };
+  }
+
+  /* Draw each started item of a fan-out (parallel map, pipeline, repeat) as
+     its own column, so every parallel agent has its own node; a fan-out
+     inside a column opens into columns of its own. Above ``limit`` items a
+     fan-out stays one node with a count. Returns {graph, signature}. */
   function expandFanouts(graph, match, limit) {
     limit = limit || 24;
     var sig = [];
-    function expand(node) {
+    function both(f, g) { return f && g ? function (a) { return f(a) && g(a); } : (f || g); }
+    function expand(node, filter, suffix) {
+      var id = node.id ? node.id + suffix : node.id;
       switch (node.k) {
-        case "seq": return Object.assign({}, node, { items: node.items.map(expand) });
+        case "agent":
+          if (!filter) return node;
+          var pool = (match.byNode[node.id] || []).filter(filter);
+          return Object.assign({}, node, { id: id, baseId: node.id, bound: pool });
+        case "seq": return Object.assign({}, node, { items: node.items.map(function (n) { return expand(n, filter, suffix); }) });
         case "branch": case "par":
-          return Object.assign({}, node, { branches: node.branches.map(function (b) { return { label: b.label, seq: expand(b.seq) }; }) });
-        case "loop": case "group": return Object.assign({}, node, { body: expand(node.body) });
+          return Object.assign({}, node, { id: id, branches: node.branches.map(function (b) { return { label: b.label, seq: expand(b.seq, filter, suffix) }; }) });
+        case "loop": case "group": return Object.assign({}, node, { id: id, body: expand(node.body, filter, suffix) });
         case "each":
-          var count = 0;
-          agentsBelow(node.body).forEach(function (a) { count = Math.max(count, (match.byNode[a.id] || []).length); });
-          sig.push(node.id + ":" + Math.min(count, limit + 1));
-          if (count > 1 && count <= limit) {
-            assignColumns(agentsBelow(node.body), match, count);
-            var branches = [];
-            for (var i = 0; i < count; i++) branches.push({ label: "", seq: bindClone(node.body, i) });
-            return Object.assign({}, node, { expanded: count,
-              body: { k: "seq", items: [{ k: "par", id: node.id + "~cols", title: "", bare: true, branches: branches }] } });
+          var cols = columnsFor(agentsBelow(node.body), match, filter, node.level);
+          sig.push(id + ":" + Math.min(cols.count, limit + 1));
+          if (cols.count > 1 && cols.count <= limit) {
+            var branches = cols.filters.map(function (f, i) { return { label: "", seq: expand(node.body, both(filter, f), suffix + "#" + i) }; });
+            return Object.assign({}, node, { id: id, expanded: cols.count,
+              body: { k: "seq", items: [{ k: "par", id: id + "~cols", title: "", bare: true, branches: branches }] } });
           }
-          return Object.assign({}, node, { body: expand(node.body) });
-        default: return node;
+          return Object.assign({}, node, { id: id, body: expand(node.body, filter, suffix) });
+        default: return filter ? Object.assign({}, node, { id: id }) : node;
       }
     }
-    var seq = expand(graph.seq);
+    var seq = expand(graph.seq, null, "");
     return { graph: Object.assign({}, graph, { seq: seq }), signature: sig.join(",") };
+  }
+
+  /* How many rounds a loop has run. Exact when an agent's label carries the
+     loop's counter (review:${f}:r${round}); else the starts of an agent that
+     runs once per round (not inside a fan-out or an inner loop). Returns
+     {rounds} or null when it cannot be told. */
+  function loopRounds(loop, match) {
+    var vars = loop.vars || [];
+    var best = null;
+    agentsBelow(loop.body).forEach(function (an) {
+      var exprs = an.labelExprs || [];
+      exprs.forEach(function (ids, i) {
+        if (!ids.some(function (id) { return vars.indexOf(id) >= 0; })) return;
+        var values = [];
+        instancesFor(an, match).forEach(function (a) {
+          var v = (captures(an, a) || [])[i];
+          if (v !== undefined && values.indexOf(v) < 0) values.push(v);
+        });
+        if (!values.length) return;
+        var numeric = values.every(function (v) { return /^\d+$/.test(v); });
+        var rounds = numeric ? Math.max.apply(null, values.map(Number)) : values.length;
+        if (numeric && Math.min.apply(null, values.map(Number)) === 0) rounds += 1;   // counted from 0
+        best = Math.max(best || 0, rounds);
+      });
+    });
+    if (best !== null) return { rounds: best };
+    var direct = [];
+    (function walk(n) {
+      if (!n || n.k === "each" || (n !== loop && n.k === "loop")) return;
+      if (n.k === "agent") direct.push(n);
+      if (n.items) n.items.forEach(walk);
+      if (n.branches) n.branches.forEach(function (b) { walk(b.seq); });
+      if (n.body) walk(n.body);
+    })(loop);
+    if (!direct.length) return null;
+    var most = 0;
+    direct.forEach(function (an) { most = Math.max(most, instancesFor(an, match).length); });
+    return most ? { rounds: most } : null;
   }
 
   /* Collect the agent nodes below a container node. */
@@ -3127,6 +3416,7 @@ GRAPH_JS = r"""/* workflow-watch: turn a Workflow script into a flow graph, matc
 
   var api = { buildGraph: buildGraph, runtimeGraph: runtimeGraph, matchAgents: matchAgents,
               layout: layout, agentsBelow: agentsBelow, expandFanouts: expandFanouts, instancesFor: instancesFor, findMeta: findMeta, parseScript: parseScript,
+              loopRounds: loopRounds, itemParts: itemParts,
               literalValue: literalValue };
   root.WWGraph = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
@@ -3254,19 +3544,31 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     if (depth > 8) return el("pre", { text: JSON.stringify(v, null, 1) });
     if (Array.isArray(v)) {
       if (!v.length) return el("span", { class: "val-lit", text: "[ ]" });
-      var list = el("ol", { class: "val-list" });
+      var simple = v.every(function (item) { return item === null || typeof item !== "object"; });
+      var list = el(simple ? "ul" : "ol", { class: "val-list" + (simple ? "" : " val-cards") });
       v.slice(0, 300).forEach(function (item) { list.appendChild(el("li", null, [renderValue(item, depth + 1)])); });
       if (v.length > 300) list.appendChild(el("li", { class: "sub", text: "… " + (v.length - 300) + " more" }));
       return list;
     }
     var keys = Object.keys(v);
     if (!keys.length) return el("span", { class: "val-lit", text: "{ }" });
-    var dl = el("dl", { class: "val-obj" + (depth ? " val-nested" : "") });
+    // each field: its name as a small heading, its value below it
+    var box = el("div", { class: "val-obj val-d" + Math.min(depth, 3) });
     keys.forEach(function (k) {
-      dl.appendChild(el("dt", { text: k }));
-      dl.appendChild(el("dd", null, [renderValue(v[k], depth + 1)]));
+      box.appendChild(el("section", { class: "val-field" }, [
+        el("div", { class: "val-key", title: k, text: humanKey(k) }),
+        el("div", { class: "val-v" }, [renderValue(v[k], depth + 1)]),
+      ]));
     });
-    return dl;
+    return box;
+  }
+
+  /* "test_result" -> "Test result", "filesCreated" -> "Files created". */
+  function humanKey(k) {
+    var t = String(k).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+    if (!t) return String(k);
+    if (t === t.toUpperCase()) return t;              // keep acronyms like "ID", "URL"
+    return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase().replace(/\b(id|url|api|ui|sql|json|http)\b/g, function (w) { return w.toUpperCase(); });
   }
 
   // ------------------------------------------------------------- router
@@ -3388,7 +3690,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
   function runView(main, runId) {
     var stopped = false, timer = null, version = null;
     var st = { detail: null, stat: null, graph: null, graphNote: null, nodeEls: {}, match: null,
-               zoom: 1, userZoom: false, runtimeKey: null, selected: null };
+               zoom: 1, userZoom: false, runtimeKey: null, selected: null, prompts: {}, promptsBusy: false };
     document.getElementById("crumb").textContent = runId;
 
     var headBox = el("div", { class: "body" });
@@ -3498,8 +3800,26 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
     function shownGraph() {
       var graph = currentGraph();
       var agents = (st.detail && st.detail.agents) || [];
-      st.match = G.matchAgents(graph, agents);
+      st.match = G.matchAgents(graph, agents, st.prompts);
       return G.expandFanouts(graph, st.match);
+    }
+
+    /* The start of each agent's task text, fetched once per agent: the
+       matching uses it for agents whose label says nothing. */
+    function loadPrompts() {
+      if (!st.graph || st.promptsBusy) return;
+      var agents = (st.detail && st.detail.agents) || [];
+      var missing = agents.filter(function (a) { return !(a.agentId in st.prompts); }).map(function (a) { return a.agentId; });
+      if (!missing.length) return;
+      st.promptsBusy = true;
+      getJSON("/api/prompts?run=" + encodeURIComponent(runId) + "&ids=" + encodeURIComponent(missing.slice(0, 200).join(",")))
+        .then(function (data) {
+          Object.keys(data.prompts || {}).forEach(function (id) { st.prompts[id] = data.prompts[id]; });
+          missing.slice(0, 200).forEach(function (id) { if (!(id in st.prompts)) st.prompts[id] = ""; });
+          paintGraph();
+        })
+        .catch(function () { /* matching works without them */ })
+        .then(function () { st.promptsBusy = false; });
     }
 
     function drawGraph() {
@@ -3629,7 +3949,10 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
           var cst = nodeState(all);
           box.className = "gnode container " + n.k + (cst === "running" ? " running" : "");
           var count = box.querySelector(".count");
-          if (n.k === "loop") count.textContent = maxCount ? "round " + maxCount : "";
+          if (n.k === "loop") {
+            var rounds = G.loopRounds(n, st.match);
+            count.textContent = rounds ? "round " + rounds.rounds : (all.length ? all.length + " agent" + (all.length > 1 ? "s" : "") + " started" : "");
+          }
           else if (n.k === "each") {
             var done = all.filter(function (a) { return a.state === "done" || a.state === "failed"; }).length;
             count.textContent = all.length ? done + " / " + all.length + " done" : "";
@@ -3778,6 +4101,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
         st.detail = data;
         renderHead(); renderNotes(); renderAgents(); renderLogsAndResult();
         paintGraph();
+        loadPrompts();
         if (lastStatus !== null && lastStatus !== data.run.status) loadStatic();
         lastStatus = data.run.status;
         refreshDrawer(runId, st.match);
@@ -4032,7 +4356,7 @@ APP_JS = r"""/* workflow-watch page. Every piece of data goes into the page thro
 
     if (data.prompt && changed(dom, "prompt", data.prompt.length)) {
       clear(dom.prompt);
-      dom.prompt.appendChild(el("details", null, [el("summary", { text: "Prompt (" + data.prompt.length + " characters)" }),
+      dom.prompt.appendChild(el("details", null, [el("summary", { text: "Prompt (" + data.prompt.length + " characters" + (data.promptFramed ? ", without the frame Claude Code adds" : "") + ")" }),
         el("div", { class: "box" }, [codeBlockOrProse(data.prompt)])]));
     }
 

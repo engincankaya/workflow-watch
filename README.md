@@ -192,6 +192,10 @@ python3 -m unittest discover -s tests
 
 Tests without Node.js skip the parts that need it.
 
+## License
+
+MIT License, Copyright (c) 2026 Engincan Kaya. See [LICENSE](LICENSE).
+
 ## Third-party code
 
 The page reads workflow scripts with [acorn](https://github.com/acornjs/acorn)
